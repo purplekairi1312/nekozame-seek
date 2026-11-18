@@ -68,14 +68,15 @@ class Slskd:
         return json.loads(data) if data else None
 
     def status(self):
-        """'logged in as NAME', or why not"""
+        """who you're logged in as and what you share, or why not"""
         try:
-            server = self.call("GET", "/application").get("server", {})
+            app = self.call("GET", "/application")
         except (OSError, ValueError) as e:
             return f"slskd isn't answering at {self.url} ({e})"
+        server, user, shares = app.get("server", {}), app.get("user", {}), app.get("shares", {})
         if server.get("isLoggedIn"):
-            return f"logged in as {server.get('username', '?')}"
-        return f"not logged in to Soulseek ({server.get('state', '?')}): on agartha, ~/slskd/set-login"
+            return f"logged in as {user.get('username', '?')} · sharing {shares.get('files', 0):,} files"
+        return f"not logged in to Soulseek ({server.get('state') or 'no login yet'}): on the server, ~/slskd/set-login"
 
     def search(self, text):
         return self.call("POST", "/searches", {"searchText": text})["id"]
@@ -155,7 +156,26 @@ def title(a):
 
 # --- the TUI -----------------------------------------------------------------------------
 
+HELP = """[b #ffc0e5]How it works[/]
+
+  Type what you're looking for (artist and album) and press [b]Enter[/].
+
+  Albums come in best first:
+    [#ffd4ee]1.[/] lossless (FLAC, WAV…) before lossy (MP3…)
+    [#ffd4ee]2.[/] the highest bit depth: 32, then 24, then 16
+    [#ffd4ee]3.[/] the highest sample rate: 192 kHz, then 96, then 48, then 44.1
+    [#ffd4ee]4.[/] the biggest, counting only the music
+
+  [b #ffc0e5]★[/] marks the best one, already picked: [b]Enter[/] downloads the whole album.
+  [b]↑ ↓[/] to pick another.
+
+  [#b3a7cb]b / s / f  best first / biggest / fastest      d  downloads
+  /  search again                                q  quit[/]
+"""
+
+
 def tui(first_search=None):
+    os.environ.setdefault("COLORTERM", "truecolor")  # over ssh it isn't said, and it's all grey without
     from textual.app import App
     from textual.binding import Binding
     from textual.containers import Vertical
@@ -166,36 +186,53 @@ def tui(first_search=None):
 
     class Seek(App):
         TITLE = "nekozame-seek"
+        ENABLE_COMMAND_PALETTE = False
         CSS = """
         Screen { background: #5a4f6e; color: #ffffff; }
-        #status { height: 1; padding: 0 1; background: #433a55; color: #ffd4ee; }
-        Input { background: #433a55; border: round #ffc0e5; color: #ffffff; }
-        Input:focus { border: round #ffd4ee; }
-        DataTable { background: #4f4562; height: 1fr; }
+        #top { height: 1; padding: 0 1; background: #433a55; }
+        #title { width: auto; color: #ffc0e5; text-style: bold; }
+        #status { width: 1fr; color: #e8def5; text-align: right; }
+        TabbedContent { height: 1fr; }
+        Tabs { background: #4f4562; }
+        Tab { color: #e8def5; }
+        Tab.-active { color: #ffc0e5; text-style: bold; }
+        Underline > .underline--bar { color: #ffc0e5; background: #685c7f; }
+        Input { background: #433a55; border: round #8a76a8; color: #ffffff; margin: 1 1 0 1; }
+        Input:focus { border: round #ffc0e5; }
+        Input > .input--placeholder { color: #b3a7cb; }
+        #help { padding: 1 3; color: #ffffff; }
+        #summary { height: 1; padding: 0 2; color: #ffd4ee; }
+        DataTable { background: #4f4562; height: 1fr; margin: 0 1; scrollbar-color: #8a76a8; scrollbar-background: #433a55; }
         DataTable > .datatable--header { background: #433a55; color: #ffc0e5; text-style: bold; }
-        DataTable > .datatable--cursor { background: #ffc0e5; color: #433a55; }
-        TabbedContent Tabs { background: #433a55; }
-        Tab.-active { color: #ffc0e5; }
-        Underline > .underline--bar { color: #8a76a8; background: #433a55; }
-        Footer { background: #433a55; }
+        DataTable > .datatable--cursor { background: #ffc0e5; color: #433a55; text-style: bold; }
+        DataTable > .datatable--hover { background: #685c7f; }
+        Footer { background: #433a55; color: #e8def5; }
+        FooterKey { background: #433a55; }
+        FooterKey .footer-key--key { background: #433a55; color: #ffc0e5; text-style: bold; }
+        FooterKey .footer-key--description { background: #433a55; color: #e8def5; }
         """
         BINDINGS = [
-            Binding("enter", "download", "download album", show=True),
-            Binding("q", "sort('quality')", "by quality"),
-            Binding("s", "sort('size')", "by size"),
-            Binding("p", "sort('speed')", "by speed"),
-            Binding("slash", "focus_search", "search"),
+            Binding("b", "sort('quality')", "best first"),
+            Binding("s", "sort('size')", "biggest"),
+            Binding("f", "sort('speed')", "fastest"),
+            Binding("slash", "focus_search", "new search"),
             Binding("d", "show_downloads", "downloads"),
-            Binding("ctrl+c", "quit", "quit"),
+            Binding("q", "quit", "quit"),
+            Binding("ctrl+c", "quit", "quit", show=False),
         ]
 
         def compose(self):
-            yield Static("…", id="status")
+            from textual.containers import Horizontal
+            with Horizontal(id="top"):
+                yield Static("🦈 nekozame-seek", id="title")
+                yield Static("…", id="status")
             with TabbedContent(initial="search"):
                 with TabPane("search", id="search"):
                     with Vertical():
-                        yield Input(placeholder="artist album… (Enter searches; the best album is picked)", id="query")
-                        yield DataTable(id="results", cursor_type="row", zebra_stripes=False)
+                        yield Input(placeholder="search Soulseek: artist and album, then Enter", id="query")
+                        yield Static("", id="summary")
+                        yield Static(HELP, id="help")
+                        yield DataTable(id="results", cursor_type="row")
                 with TabPane("downloads", id="downloads"):
                     yield DataTable(id="transfers", cursor_type="row")
             yield Footer()
@@ -203,30 +240,41 @@ def tui(first_search=None):
         def on_mount(self):
             self.sort, self.found, self.sid, self.searching = "quality", [], None, False
             res = self.query_one("#results", DataTable)
-            res.add_columns("", "quality", "format", "MB", "files", "album", "user", "slot")
-            self.query_one("#transfers", DataTable).add_columns("album", "user", "files", "done", "state")
+            res.add_columns("", "bits", "kHz", "format", "size", "tracks", "from", "can start", "album")
+            res.display = False
+            self.query_one("#transfers", DataTable).add_columns("album", "from", "tracks", "done", "state")
             self.set_interval(1.0, self.poll)
             self.set_interval(3.0, self.poll_downloads)
-            self.status_text = api.status()
-            self.query_one("#status", Static).update(self.status_text)
+            self.set_interval(30.0, self.refresh_status)
+            self.refresh_status()
             if first_search:
                 self.query_one("#query", Input).value = first_search
                 self.start(first_search)
             else:
                 self.query_one("#query", Input).focus()
 
+        def refresh_status(self):
+            self.query_one("#status", Static).update(api.status())
+
         def start(self, text):
             try:
-                self.sid, self.found, self.searching, self.started = api.search(text), [], True, time.time()
+                self.sid, self.found, self.searching, self.text = api.search(text), [], True, text
             except (OSError, ValueError, KeyError) as e:
-                self.query_one("#status", Static).update(f"couldn't search: {e}")
+                self.query_one("#summary", Static).update(f"couldn't search: {e}")
                 return
+            self.query_one("#help", Static).display = False
+            res = self.query_one("#results", DataTable)
+            res.display = True
             self.show()
-            self.query_one("#results", DataTable).focus()
+            res.focus()
 
         def on_input_submitted(self, event):
             if event.value.strip():
                 self.start(event.value.strip())
+
+        def on_data_table_row_selected(self, event):
+            if event.data_table.id == "results":
+                self.download(event.cursor_row)
 
         def poll(self):
             if not self.sid or not self.searching:
@@ -245,14 +293,21 @@ def tui(first_search=None):
             self.found.sort(key=SORTS[self.sort], reverse=True)
             res.clear()
             for i, a in enumerate(self.found[:400]):
-                res.add_row("★" if i == 0 and self.sort == "quality" else "", quality(a), a["format"],
-                            f"{a['mb']:.0f}", str(len(a["audio"])), title(a), a["user"],
-                            "free" if a["free"] else f"queue {a['queue']}", key=str(i))
+                bits = str(a["depth"]) if a["lossless"] else f"{a['bitrate']}k" if a["bitrate"] else "?"
+                khz = f"{a['rate'] / 1000:g}" if a["rate"] else ""
+                res.add_row("★" if i == 0 and self.sort == "quality" else "", bits, khz, a["format"],
+                            f"{a['mb']:,.0f} MB", str(len(a["audio"])), a["user"][:18],
+                            "now" if a["free"] else f"{a['queue']} in line", title(a), key=str(i))
             if self.found:
                 res.move_cursor(row=min(at, len(self.found) - 1))
-            what = "searching… " if self.searching else ""
-            self.query_one("#status", Static).update(
-                f"{what}{len(self.found)} albums · sorted by {self.sort} · {self.status_text}")
+            how = {"quality": "best first", "size": "biggest first", "speed": "fastest first"}[self.sort]
+            if self.searching:
+                text = f"searching for “{self.text}”… {len(self.found)} albums so far, {how}"
+            elif self.found:
+                text = f"{len(self.found)} albums for “{self.text}”, {how} · Enter downloads the one picked"
+            else:
+                text = f"nothing found for “{self.text}”: try fewer words"
+            self.query_one("#summary", Static).update(text)
 
         def action_sort(self, how):
             self.sort = how
@@ -266,17 +321,16 @@ def tui(first_search=None):
             self.query_one(TabbedContent).active = "downloads"
             self.poll_downloads()
 
-        def action_download(self):
-            res = self.query_one("#results", DataTable)
-            if self.query_one(TabbedContent).active != "search" or not self.found or not res.has_focus:
+        def download(self, row):
+            if not self.found:
                 return
-            a = self.found[res.cursor_row]
+            a = self.found[row]
             try:
                 api.download(a["user"], a["files"])  # the whole folder: the music, its cover, the log
             except (OSError, ValueError) as e:
                 self.notify(f"couldn't queue it: {e}", severity="error")
                 return
-            self.notify(f"downloading {title(a)} ({a['mb']:.0f} MB, {quality(a)}) from {a['user']}")
+            self.notify(f"downloading {title(a)}: {a['mb']:,.0f} MB, {quality(a)} {a['format']}, from {a['user']} (d shows it)")
 
         def poll_downloads(self):
             if self.query_one(TabbedContent).active != "downloads":
@@ -292,8 +346,8 @@ def tui(first_search=None):
                     files = d.get("files") or []
                     size = sum(f.get("size") or 0 for f in files) or 1
                     done = sum(f.get("bytesTransferred") or 0 for f in files)
-                    states = {(f.get("state") or "").split(",")[0].strip() for f in files}
-                    state = "done" if states <= {"Completed"} else ", ".join(sorted(states))
+                    states = {(f.get("state") or "").split(",")[-1].strip() for f in files}
+                    state = "done" if states <= {"Succeeded"} else ", ".join(sorted(states)).lower()
                     t.add_row(" / ".join(folder(d["directory"] + "\\x")[-2:]), u["username"],
                               str(len(files)), f"{100 * done / size:.0f}%", state)
 
