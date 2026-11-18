@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""nekozame-seek: Soulseek in the terminal, through slskd.
+
+slskd stays logged in, shares and downloads all the time (on a server); this is where you
+search and pick, over ssh or on your own machine. Close it and everything keeps going.
+
+Results come as albums (one user's folder), the best first:
+  1. lossless before lossy
+  2. the highest bit depth, then the highest sample rate (24/192 before 24/96 before 16/44.1)
+  3. the biggest in MB, counting only the audio files (not scans, booklets or a second
+     copy in another format)
+The best one is picked: Enter downloads the whole album.
+
+  nekozame-seek                 the TUI
+  nekozame-seek "search words"  the TUI, searching straight away
+
+Settings: ~/.config/nekozame-seek/config.toml
+  url = "http://localhost:5030"   slskd's address (on another machine: its Tailscale name)
+  api_key = "..."                 slskd's API key (on the machine slskd runs on, it's read
+                                  from ~/slskd/app/slskd.yml when this isn't set)
+"""
+import json
+import os
+import re
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+AUDIO = {"flac": 3, "wav": 3, "aiff": 3, "aif": 3, "alac": 3, "ape": 3, "wv": 3, "dsf": 3, "dff": 3,
+         "m4a": 1, "mp3": 1, "ogg": 1, "opus": 1, "aac": 1, "wma": 1}
+LOSSLESS = {e for e, v in AUDIO.items() if v == 3}
+CONFIG = os.path.expanduser("~/.config/nekozame-seek/config.toml")
+
+
+# --- slskd ------------------------------------------------------------------------------
+
+def settings():
+    conf = {}
+    try:
+        with open(CONFIG, "rb") as f:
+            conf = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    conf.setdefault("url", "http://localhost:5030")
+    if not conf.get("api_key"):  # on slskd's own machine: its key, read where it's kept
+        try:
+            text = open(os.path.expanduser("~/slskd/app/slskd.yml")).read()
+            m = re.search(r"nekozame_seek:\s*\n\s*key:\s*(\S+)", text)
+            if m:
+                conf["api_key"] = m.group(1)
+        except OSError:
+            pass
+    return conf
+
+
+class Slskd:
+    def __init__(self, url, key):
+        self.url, self.key = url.rstrip("/"), key or ""
+
+    def call(self, method, path, body=None):
+        req = urllib.request.Request(f"{self.url}/api/v0{path}", method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"X-API-Key": self.key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+        return json.loads(data) if data else None
+
+    def status(self):
+        """'logged in as NAME', or why not"""
+        try:
+            server = self.call("GET", "/application").get("server", {})
+        except (OSError, ValueError) as e:
+            return f"slskd isn't answering at {self.url} ({e})"
+        if server.get("isLoggedIn"):
+            return f"logged in as {server.get('username', '?')}"
+        return f"not logged in to Soulseek ({server.get('state', '?')}): on agartha, ~/slskd/set-login"
+
+    def search(self, text):
+        return self.call("POST", "/searches", {"searchText": text})["id"]
+
+    def search_state(self, sid):
+        return self.call("GET", f"/searches/{sid}")
+
+    def responses(self, sid):
+        return self.call("GET", f"/searches/{sid}/responses") or []
+
+    def download(self, username, files):
+        self.call("POST", f"/transfers/downloads/{urllib.request.quote(username)}",
+                  [{"filename": f["filename"], "size": f["size"]} for f in files])
+
+    def downloads(self):
+        return self.call("GET", "/transfers/downloads") or []
+
+
+# --- albums: the results, grouped and ranked ---------------------------------------------
+
+def folder(path):
+    return re.split(r"[\\/]", path)[:-1]
+
+
+def ext(f):
+    return (f.get("extension") or os.path.splitext(f["filename"])[1]).lower().lstrip(".")
+
+
+def albums(responses):
+    """each user's folders with audio in them, as albums with their quality"""
+    out = []
+    for r in responses:
+        by_folder = {}
+        for f in r.get("files") or []:
+            by_folder.setdefault(tuple(folder(f["filename"])), []).append(f)
+        for path, files in by_folder.items():
+            audio = [f for f in files if ext(f) in AUDIO]
+            if not audio:
+                continue
+            lossless = [f for f in audio if ext(f) in LOSSLESS]
+            main = lossless or audio  # the album's real format: its lossless files if it has them
+            depth = max((f.get("bitDepth") or 0) for f in main)
+            rate = max((f.get("sampleRate") or 0) for f in main)
+            if lossless and not depth:  # not said: CD quality, the usual
+                depth, rate = 16, rate or 44100
+            out.append({
+                "user": r["username"], "path": path, "files": files, "audio": main,
+                "lossless": bool(lossless), "depth": depth, "rate": rate,
+                "bitrate": max((f.get("bitRate") or 0) for f in main),
+                "mb": sum(f["size"] for f in main) / 1e6,
+                "format": "/".join(sorted({ext(f).upper() for f in main})),
+                "free": r.get("hasFreeUploadSlot", False), "speed": r.get("uploadSpeed") or 0,
+                "queue": r.get("queueLength") or 0,
+            })
+    return out
+
+
+SORTS = {
+    # the default: lossless, bit depth, sample rate, then the biggest; a free slot and speed break ties
+    "quality": lambda a: (a["lossless"], a["depth"], a["rate"], a["bitrate"] if not a["lossless"] else 0,
+                          a["mb"], a["free"], a["speed"]),
+    "size": lambda a: (a["mb"], a["lossless"], a["depth"], a["rate"]),
+    "speed": lambda a: (a["free"], a["speed"], -a["queue"]),
+}
+
+
+def quality(a):
+    if a["lossless"]:
+        return f"{a['depth']}/{a['rate'] / 1000:g}"
+    return f"{a['bitrate']}k" if a["bitrate"] else "?"
+
+
+def title(a):
+    parts = [p for p in a["path"] if p]
+    return " / ".join(parts[-2:]) if parts else "(top folder)"
+
+
+# --- the TUI -----------------------------------------------------------------------------
+
+def tui(first_search=None):
+    from textual.app import App
+    from textual.binding import Binding
+    from textual.containers import Vertical
+    from textual.widgets import DataTable, Footer, Input, Static, TabbedContent, TabPane
+
+    conf = settings()
+    api = Slskd(conf["url"], conf.get("api_key"))
+
+    class Seek(App):
+        TITLE = "nekozame-seek"
+        CSS = """
+        Screen { background: #5a4f6e; color: #ffffff; }
+        #status { height: 1; padding: 0 1; background: #433a55; color: #ffd4ee; }
+        Input { background: #433a55; border: round #ffc0e5; color: #ffffff; }
+        Input:focus { border: round #ffd4ee; }
+        DataTable { background: #4f4562; height: 1fr; }
+        DataTable > .datatable--header { background: #433a55; color: #ffc0e5; text-style: bold; }
+        DataTable > .datatable--cursor { background: #ffc0e5; color: #433a55; }
+        TabbedContent Tabs { background: #433a55; }
+        Tab.-active { color: #ffc0e5; }
+        Underline > .underline--bar { color: #8a76a8; background: #433a55; }
+        Footer { background: #433a55; }
+        """
+        BINDINGS = [
+            Binding("enter", "download", "download album", show=True),
+            Binding("q", "sort('quality')", "by quality"),
+            Binding("s", "sort('size')", "by size"),
+            Binding("p", "sort('speed')", "by speed"),
+            Binding("slash", "focus_search", "search"),
+            Binding("d", "show_downloads", "downloads"),
+            Binding("ctrl+c", "quit", "quit"),
+        ]
+
+        def compose(self):
+            yield Static("…", id="status")
+            with TabbedContent(initial="search"):
+                with TabPane("search", id="search"):
+                    with Vertical():
+                        yield Input(placeholder="artist album… (Enter searches; the best album is picked)", id="query")
+                        yield DataTable(id="results", cursor_type="row", zebra_stripes=False)
+                with TabPane("downloads", id="downloads"):
+                    yield DataTable(id="transfers", cursor_type="row")
+            yield Footer()
+
+        def on_mount(self):
+            self.sort, self.found, self.sid, self.searching = "quality", [], None, False
+            res = self.query_one("#results", DataTable)
+            res.add_columns("", "quality", "format", "MB", "files", "album", "user", "slot")
+            self.query_one("#transfers", DataTable).add_columns("album", "user", "files", "done", "state")
+            self.set_interval(1.0, self.poll)
+            self.set_interval(3.0, self.poll_downloads)
+            self.status_text = api.status()
+            self.query_one("#status", Static).update(self.status_text)
+            if first_search:
+                self.query_one("#query", Input).value = first_search
+                self.start(first_search)
+            else:
+                self.query_one("#query", Input).focus()
+
+        def start(self, text):
+            try:
+                self.sid, self.found, self.searching, self.started = api.search(text), [], True, time.time()
+            except (OSError, ValueError, KeyError) as e:
+                self.query_one("#status", Static).update(f"couldn't search: {e}")
+                return
+            self.show()
+            self.query_one("#results", DataTable).focus()
+
+        def on_input_submitted(self, event):
+            if event.value.strip():
+                self.start(event.value.strip())
+
+        def poll(self):
+            if not self.sid or not self.searching:
+                return
+            try:
+                state = api.search_state(self.sid)
+                self.found = albums(api.responses(self.sid))
+            except (OSError, ValueError):
+                return
+            self.searching = not state.get("isComplete")
+            self.show(keep_cursor=True)
+
+        def show(self, keep_cursor=False):
+            res = self.query_one("#results", DataTable)
+            at = res.cursor_row if keep_cursor else 0
+            self.found.sort(key=SORTS[self.sort], reverse=True)
+            res.clear()
+            for i, a in enumerate(self.found[:400]):
+                res.add_row("★" if i == 0 and self.sort == "quality" else "", quality(a), a["format"],
+                            f"{a['mb']:.0f}", str(len(a["audio"])), title(a), a["user"],
+                            "free" if a["free"] else f"queue {a['queue']}", key=str(i))
+            if self.found:
+                res.move_cursor(row=min(at, len(self.found) - 1))
+            what = "searching… " if self.searching else ""
+            self.query_one("#status", Static).update(
+                f"{what}{len(self.found)} albums · sorted by {self.sort} · {self.status_text}")
+
+        def action_sort(self, how):
+            self.sort = how
+            self.show()
+
+        def action_focus_search(self):
+            self.query_one(TabbedContent).active = "search"
+            self.query_one("#query", Input).focus()
+
+        def action_show_downloads(self):
+            self.query_one(TabbedContent).active = "downloads"
+            self.poll_downloads()
+
+        def action_download(self):
+            res = self.query_one("#results", DataTable)
+            if self.query_one(TabbedContent).active != "search" or not self.found or not res.has_focus:
+                return
+            a = self.found[res.cursor_row]
+            try:
+                api.download(a["user"], a["files"])  # the whole folder: the music, its cover, the log
+            except (OSError, ValueError) as e:
+                self.notify(f"couldn't queue it: {e}", severity="error")
+                return
+            self.notify(f"downloading {title(a)} ({a['mb']:.0f} MB, {quality(a)}) from {a['user']}")
+
+        def poll_downloads(self):
+            if self.query_one(TabbedContent).active != "downloads":
+                return
+            try:
+                users = api.downloads()
+            except (OSError, ValueError):
+                return
+            t = self.query_one("#transfers", DataTable)
+            t.clear()
+            for u in users:
+                for d in u.get("directories") or []:
+                    files = d.get("files") or []
+                    size = sum(f.get("size") or 0 for f in files) or 1
+                    done = sum(f.get("bytesTransferred") or 0 for f in files)
+                    states = {(f.get("state") or "").split(",")[0].strip() for f in files}
+                    state = "done" if states <= {"Completed"} else ", ".join(sorted(states))
+                    t.add_row(" / ".join(folder(d["directory"] + "\\x")[-2:]), u["username"],
+                              str(len(files)), f"{100 * done / size:.0f}%", state)
+
+    Seek().run()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print(__doc__)
+        sys.exit(0)
+    tui(" ".join(sys.argv[1:]) or None)
