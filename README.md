@@ -5,7 +5,8 @@ A TUI for Soulseek, meant for servers and high-quality collections. [slskd](http
 - Albums best pick first: lossless, then the highest bit depth, sample rate and size (only the music files counts). Enter downloads the one picked
 - Finds what Soulseek blocks searches for (The Beatles, some album titles): it asks again another way (`*eatles`) and keeps what matches what you typed
 - Individual tracks on their own tab, `space` shows what's inside an album, and your recent searches are kept
-- Finished downloads into your library, the way it's organized: the sure ones by themselves (`nekozame-seek organize`, from a timer), the rest in the library tab after you've seen where to. Never over anything, and every move can be undone
+- Puts what you download into your music library for you, with [beets](https://beets.io): it recognises each album, fixes its tags and files it in the right folder ([how](docs/library.md))
+- Choose what you share: browse your folders and switch each one on or off
 - In [nekozame colours](https://git.sr.ht/~purplekairi1312/nekozame-theme)
 
 ## Install
@@ -32,11 +33,9 @@ And tell nekozame-seek about it, in `~/.config/nekozame-seek/config.toml`:
 ```toml
 url = "http://localhost:5030"   # slskd's address
 api_key = "PUT-A-LONG-RANDOM-KEY-HERE"
-downloads = "/path/to/slskd/downloads"   # for the library tab
-library = "/path/to/your/music"
 ```
 
-To put finished downloads away by themselves, run `nekozame-seek organize` every few minutes, for example from a systemd timer (`contrib/` has one) or cron.
+To have it put downloads in your library, see [docs/library.md](docs/library.md).
 
 ## License
 

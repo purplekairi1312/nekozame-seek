@@ -1,73 +1,28 @@
-//! Finished downloads put where they belong in the library, the library's own way: a folder
-//! per artist in "Artist Albums", each album in it under the name it came with (tracks keep
-//! theirs too); soundtracks in "Soundtracks/Interactive Media" (games) or "Linear Media"
-//! (films, series, anime); single songs loose in the artist's folder. Nothing moves without
-//! being shown first, nothing is ever overwritten, and every move is written down so it can
-//! be undone.
+//! Finished downloads into your library, through beets (beets.io): it looks each one up on
+//! MusicBrainz, fixes its tags and moves it where its own `paths` say. nekozame-seek finds
+//! what's finished and hands it over: by itself for what beets is sure of (organize), or
+//! from the library tab, where beets asks you about the rest. Soundtracks always wait for
+//! you (where they go is often your call: a game's, a film's...).
 
-use crate::rank::{is_audio, LOSSLESS};
+use crate::rank::is_audio;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Kind {
-    Artist,
-    Game,
-    Film,
-    Unsorted,
+/// a finished download, for the library tab
+pub struct Done {
+    pub path: PathBuf,
+    pub soundtrack: bool,
+    pub quality: String,
 }
 
-impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Artist, Kind::Game, Kind::Film, Kind::Unsorted];
-
-    pub fn folder(self) -> &'static str {
-        match self {
-            Kind::Artist => "Artist Albums",
-            Kind::Game => "Soundtracks/Interactive Media",
-            Kind::Film => "Soundtracks/Linear Media",
-            Kind::Unsorted => "Unsorted Archives",
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Kind::Artist => "artist album",
-            Kind::Game => "game soundtrack",
-            Kind::Film => "film/series soundtrack",
-            Kind::Unsorted => "unsorted",
-        }
-    }
-
-    pub fn next(self) -> Kind {
-        let i = Kind::ALL.iter().position(|k| *k == self).unwrap_or(0);
-        Kind::ALL[(i + 1) % Kind::ALL.len()]
-    }
-}
-
-pub struct Todo {
-    pub src: PathBuf,
-    pub kind: Kind,
-    pub artist: String,
-    pub dest: PathBuf,
-    /// sure enough to move without asking: an artist album, its artist from the music's tags
-    /// (not guessed from a folder name), and nothing there already
-    pub sure: bool,
-}
-
-static GAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(game|video ?game|vgm|nintendo|sega|playstation|xbox|snes|gba|psx|chiptune|soundtrack for the game)\b").unwrap()
-});
 static SOUNDTRACK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(ost|o\.s\.t\.?|original (motion picture |video game |game )?soundtrack|soundtrack|score)\b").unwrap()
 });
-static ARTIST_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:\[[^\]]*\]\s*|\(\d{4}\)\s*|\d{4}\s*[-.]\s*)?(.+?)\s+-\s+.+").unwrap());
 
 fn ext(p: &Path) -> String {
     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase()
@@ -89,93 +44,30 @@ pub fn music_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// the first music file's tags: (albumartist, artist, album, genre)
-fn tags(dir: &Path) -> (String, String, String, String) {
+/// whether it looks like a soundtrack: by its name, or its first track's album and genre tags
+pub fn soundtrack(dir: &Path) -> bool {
     use lofty::prelude::*;
-    for f in music_files(dir) {
-        if let Ok(t) = lofty::read_from_path(&f) {
+    let mut text = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+    if let Some(f) = music_files(dir).first() {
+        if let Ok(t) = lofty::read_from_path(f) {
             if let Some(tag) = t.primary_tag().or_else(|| t.first_tag()) {
-                let get = |k: ItemKey| tag.get_string(k).unwrap_or("").to_string();
-                return (get(ItemKey::AlbumArtist), get(ItemKey::TrackArtist), get(ItemKey::AlbumTitle), get(ItemKey::Genre));
+                for k in [ItemKey::AlbumTitle, ItemKey::Genre] {
+                    text.push(' ');
+                    text.push_str(tag.get_string(k).unwrap_or(""));
+                }
             }
         }
     }
-    Default::default()
+    SOUNDTRACK.is_match(&text)
 }
 
-/// an artist's name to compare: no case, accents, "the" or punctuation
-pub fn plain(name: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    let n: String = name.nfkd().filter(|c| c.is_ascii()).collect::<String>().to_lowercase();
-    let n = n.strip_prefix("the ").unwrap_or(&n).to_string();
-    n.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
-}
-
-/// the artist's folder as it already is in the library (its spelling, even a near one like
-/// Gorrilaz for Gorillaz), or the name as it is
-pub fn artist_folder(library: &Path, artist: &str) -> String {
-    let want = plain(artist);
-    let folders: Vec<String> = fs::read_dir(library.join(Kind::Artist.folder()))
-        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect())
-        .unwrap_or_default();
-    if let Some(d) = folders.iter().find(|d| plain(d) == want) {
-        return d.clone();
-    }
-    let close: Vec<&String> = folders
-        .iter()
-        .filter(|d| !want.is_empty() && strsim::sorensen_dice(&plain(d), &want) >= 0.85)
-        .collect();
-    if close.len() == 1 {
-        return close[0].clone();
-    }
-    let a = artist.replace('/', "-").trim().to_string();
-    if a.is_empty() { "Unknown Artist".into() } else { a }
-}
-
-/// where a finished download goes: its kind, artist and destination, from its tags and name
-pub fn guess(library: &Path, src: &Path) -> Todo {
-    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-    let (albumartist, trackartist, album, genre) = tags(src);
-    let text = format!("{name} {album} {genre}");
-    let mut artist = if albumartist.is_empty() { trackartist } else { albumartist };
-    let tagged = !artist.is_empty();
-    if artist.is_empty() {
-        if let Some(c) = ARTIST_NAME.captures(&name) {
-            artist = c[1].to_string();
-        }
-    }
-    let kind = if SOUNDTRACK.is_match(&text) || genre.to_lowercase().contains("soundtrack") {
-        if GAME.is_match(&text) { Kind::Game } else { Kind::Film }
-    } else if artist.is_empty() {
-        Kind::Unsorted
-    } else {
-        Kind::Artist
-    };
-    let dest = destination(library, kind, &artist, src);
-    let sure = kind == Kind::Artist && tagged && dest.symlink_metadata().is_err();
-    Todo { src: src.to_path_buf(), kind, artist, dest, sure }
-}
-
-pub fn destination(library: &Path, kind: Kind, artist: &str, src: &Path) -> PathBuf {
-    let name = src.file_name().unwrap_or_default();
-    let music = music_files(src);
-    let single = music.len() == 1 && fs::read_dir(src).map(|rd| rd.flatten().all(|e| !e.path().is_dir())).unwrap_or(false);
-    if kind == Kind::Artist {
-        let base = library.join(Kind::Artist.folder()).join(artist_folder(library, artist));
-        // one song on its own: loose in the artist's folder, like the library's other singles
-        return if single { base.join(music[0].file_name().unwrap_or_default()) } else { base.join(name) };
-    }
-    library.join(kind.folder()).join(name)
-}
-
-/// a folder's (or a file's) music: the best bit depth/sample rate and its size
+/// a folder's music: the best bit depth/sample rate and its size
 pub fn quality_of(p: &Path) -> String {
     use lofty::prelude::*;
-    let files = if p.is_dir() { music_files(p) } else { vec![p.to_path_buf()] };
     let (mut depth, mut rate, mut size) = (0u32, 0u32, 0u64);
-    for f in &files {
-        size += fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-        if let Ok(t) = lofty::read_from_path(f) {
+    for f in music_files(p) {
+        size += fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+        if let Ok(t) = lofty::read_from_path(&f) {
             let props = t.properties();
             depth = depth.max(props.bit_depth().unwrap_or(0) as u32);
             rate = rate.max(props.sample_rate().unwrap_or(0));
@@ -199,9 +91,7 @@ pub fn finished(downloads: &Path, transfers: &[Value]) -> Vec<PathBuf> {
             }
         }
     }
-    let mut out: Vec<PathBuf> = fs::read_dir(downloads)
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
+    let mut out: Vec<PathBuf> = fs::read_dir(downloads).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
     out.sort();
     out.retain(|p| {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -215,173 +105,43 @@ pub fn finished(downloads: &Path, transfers: &[Value]) -> Vec<PathBuf> {
     out
 }
 
-fn moves_log() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/state/nekozame-seek/moves.jsonl")
+pub fn done(downloads: &Path, transfers: &[Value]) -> Vec<Done> {
+    finished(downloads, transfers)
+        .into_iter()
+        .map(|path| Done { soundtrack: soundtrack(&path), quality: quality_of(&path), path })
+        .collect()
 }
 
-fn sha256(p: &Path) -> std::io::Result<Vec<u8>> {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    let mut f = fs::File::open(p)?;
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
+/// beets on a download: BEET as configured (a command, maybe with arguments). Afterwards the
+/// download's folder goes if beets took all its music (and only if it's empty by then)
+pub fn beets(beet: &str, args: &[&str], path: &Path) -> bool {
+    let mut words = beet.split_whitespace();
+    let mut cmd = std::process::Command::new(words.next().unwrap_or("beet"));
+    let ok = cmd.args(words).args(args).arg(path).status().map(|s| s.success()).unwrap_or(false);
+    if ok && music_files(path).is_empty() {
+        let _ = fs::remove_dir(path);
     }
-    Ok(h.finalize().to_vec())
+    ok && !path.exists()
 }
 
-fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    if from.is_dir() {
-        fs::create_dir_all(to)?;
-        for e in fs::read_dir(from)?.flatten() {
-            copy_tree(&e.path(), &to.join(e.file_name()))?;
-        }
-    } else {
-        fs::copy(from, to)?;
-    }
-    Ok(())
-}
-
-fn files_in(p: &Path) -> Vec<PathBuf> {
-    if !p.is_dir() {
-        return vec![p.to_path_buf()];
-    }
-    let mut out = Vec::new();
-    for e in fs::read_dir(p).into_iter().flatten().flatten() {
-        out.extend(files_in(&e.path()));
-    }
-    out
-}
-
-/// src to dest, safely. On the same disk: a rename (instant, can't half-happen). On another
-/// disk: every file copied and checked byte for byte first. Never over anything: something
-/// that's there already is only replaced when asked, and then kept aside, not deleted.
-/// Written down, so it can be undone.
-pub fn move_to(src: &Path, dest: &Path, replace: bool) -> Result<(), String> {
-    let e = |x: std::io::Error| x.to_string();
-    let single = LOSSLESS.contains(&ext(dest).as_str()) || is_audio(&ext(dest));
-    let real_src = if single { music_files(src).into_iter().next().ok_or("no music in it")? } else { src.to_path_buf() };
-    let mut aside = None;
-    if dest.symlink_metadata().is_ok() {
-        if !replace {
-            return Err(format!("{} is there already", dest.display()));
-        }
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let a = dest.with_file_name(format!(".replaced-{stamp}-{}", dest.file_name().unwrap_or_default().to_string_lossy()));
-        fs::rename(dest, &a).map_err(e)?;
-        aside = Some(a);
-    }
-    let parent = dest.parent().ok_or("no folder to put it in")?;
-    fs::create_dir_all(parent).map_err(e)?;
-    #[cfg(unix)]
-    let same_disk = {
-        use std::os::unix::fs::MetadataExt;
-        fs::metadata(&real_src).map_err(e)?.dev() == fs::metadata(parent).map_err(e)?.dev()
-    };
-    #[cfg(not(unix))]
-    let same_disk = false;
-    if same_disk {
-        fs::rename(&real_src, dest).map_err(e)?;
-    } else {
-        let part = PathBuf::from(format!("{}.part", dest.display()));
-        copy_tree(&real_src, &part).map_err(e)?;
-        for f in files_in(&real_src) {
-            let copy = if single { part.clone() } else { part.join(f.strip_prefix(&real_src).unwrap_or(&f)) };
-            if sha256(&f).map_err(e)? != sha256(&copy).map_err(e)? {
-                let _ = if single { fs::remove_file(&part) } else { fs::remove_dir_all(&part) };
-                return Err(format!("the copy of {} doesn't match: nothing moved", f.display()));
-            }
-        }
-        fs::rename(&part, dest).map_err(e)?;
-        if single { fs::remove_file(&real_src).map_err(e)? } else { fs::remove_dir_all(&real_src).map_err(e)? }
-    }
-    if single && src.is_dir() && music_files(src).is_empty() {
-        let _ = fs::remove_dir_all(src); // what came with the song (a cover, a log) goes with its folder
-    }
-    let log = moves_log();
-    fs::create_dir_all(log.parent().unwrap()).map_err(e)?;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&log).map_err(e)?;
-    let line = json!({
-        "when": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        "from": real_src, "to": dest, "aside": aside,
-    });
-    writeln!(f, "{line}").map_err(e)?;
-    Ok(())
-}
-
-/// the finished downloads it's sure about, put away without asking (nekozame-seek organize,
-/// from a timer); the rest wait in the library tab. what moved, one line each
+/// what beets is sure of, put away without asking (nekozame-seek organize, from a timer); the
+/// rest (and every soundtrack) waits in the library tab. what went, one line each
 pub fn organize(cfg: &crate::Config, api: &crate::api::Slskd) -> Result<Vec<String>, String> {
-    if !cfg.library.is_dir() || !cfg.downloads.is_dir() {
-        return Err(format!("{} or {} isn't here", cfg.downloads.display(), cfg.library.display()));
+    let Some(beet) = &cfg.beets else {
+        return Err("putting downloads away needs beets: see docs/library.md".into());
+    };
+    if !cfg.downloads.is_dir() {
+        return Err(format!("{} isn't here", cfg.downloads.display()));
     }
     let transfers = api.downloads()?; // without knowing what's still downloading, nothing moves
-    let mut done = vec![];
-    for src in finished(&cfg.downloads, &transfers) {
-        let t = guess(&cfg.library, &src);
-        if !t.sure {
+    let mut out = vec![];
+    for path in finished(&cfg.downloads, &transfers) {
+        if soundtrack(&path) {
             continue;
         }
-        match move_to(&t.src, &t.dest, false) {
-            Ok(()) => done.push(format!("{} → {}", src.display(), t.dest.display())),
-            Err(e) => done.push(format!("{} not moved: {e}", src.display())),
+        if beets(beet, &["import", "-q"], &path) {
+            out.push(format!("{}: in your library", path.display()));
         }
     }
-    Ok(done)
-}
-
-/// the last move, back where it came from (and what it replaced, back in its place)
-pub fn undo_last() -> String {
-    let log = moves_log();
-    let text = fs::read_to_string(&log).unwrap_or_default();
-    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let Some(last) = lines.pop() else { return "nothing to undo".into() };
-    let Ok(m) = serde_json::from_str::<Value>(last) else { return "the moves log is broken: nothing undone".into() };
-    let (from, to) = (PathBuf::from(m["from"].as_str().unwrap_or("")), PathBuf::from(m["to"].as_str().unwrap_or("")));
-    if from.symlink_metadata().is_ok() {
-        return format!("can't undo: {} is there again", from.display());
-    }
-    if let Some(p) = from.parent() {
-        let _ = fs::create_dir_all(p);
-    }
-    if let Err(err) = fs::rename(&to, &from) {
-        return format!("couldn't undo: {err}");
-    }
-    if let Some(aside) = m["aside"].as_str() {
-        let _ = fs::rename(aside, &to);
-    }
-    let rest: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    let _ = fs::write(&log, rest);
-    format!("back in downloads: {}", from.file_name().unwrap_or_default().to_string_lossy())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_compare_plainly() {
-        assert_eq!(plain("The Cure"), plain("Cure"));
-        assert_eq!(plain("Björk"), "bjork");
-        assert!(strsim::sorensen_dice(&plain("Gorillaz"), &plain("Gorrilaz")) >= 0.85);
-        assert!(strsim::sorensen_dice(&plain("Slowdive"), &plain("Swans")) < 0.85);
-    }
-}
-
-#[cfg(test)]
-mod more_tests {
-    use super::*;
-
-    #[test]
-    fn near_spellings() {
-        let r = |a: &str, b: &str| strsim::sorensen_dice(&plain(a), &plain(b));
-        assert!(r("Billie Eilish", "Billie Eillish") >= 0.85);
-        assert!(r("Bauhaus", "Bjork") < 0.85);
-        assert!(r("Swans", "Slowdive") < 0.85);
-    }
+    Ok(out)
 }

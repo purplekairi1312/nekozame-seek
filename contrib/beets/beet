@@ -1,0 +1,8 @@
+#!/bin/sh
+# beet, from its container: its settings and database in ~/beets, and the music's disks at
+# the same paths inside as outside (so paths can be handed to it as they are). Set MUSIC to
+# the folder that holds both the downloads and the library.
+MUSIC="${MUSIC:-/mnt}"
+tty=""; [ -t 0 ] && tty="-t"
+exec podman run --rm -i $tty --userns=keep-id -v "$HOME/beets:/config" -v "$MUSIC:$MUSIC" \
+    localhost/beets:2.14.1 "$@"

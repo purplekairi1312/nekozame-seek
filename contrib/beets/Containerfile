@@ -1,0 +1,8 @@
+# beets (beets.io, MIT) in a container, for putting downloads in the library: matched on
+# MusicBrainz, tagged, cover art fetched, moved into place.
+#   podman build -t localhost/beets:2.14.1 contrib/beets/
+FROM docker.io/library/python:3.13-slim
+# filetote: the extras (scans, rip logs, cue sheets) go along with the album
+RUN pip install --no-cache-dir "beets==2.14.1" "beets-filetote==1.3.7"
+ENV BEETSDIR=/config
+ENTRYPOINT ["beet"]

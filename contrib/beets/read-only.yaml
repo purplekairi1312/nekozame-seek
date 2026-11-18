@@ -1,0 +1,10 @@
+# beets, reading a library without touching it: nothing moved, copied or written.
+#   beet -c read-only.yaml import -q /path/to/your/music
+# (the -A -C -W flags alone are not enough: a config with move: yes still moves)
+import:
+  move: no
+  copy: no
+  write: no
+  autotag: no
+  quiet: yes
+plugins: musicbrainz

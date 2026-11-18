@@ -1,6 +1,6 @@
 [package]
 name = "nekozame-seek"
-version = "1.2.0"
+version = "2.0.0"
 description = "A TUI for Soulseek, meant for servers and high-quality collections"
 license = "GPL-3.0-or-later"
 repository = "https://git.sr.ht/~purplekairi1312/nekozame-seek"
@@ -14,10 +14,7 @@ ratatui = "0.30.2"
 regex = "1.13.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sha2 = "0.11.1"
-strsim = "0.11.1"
 toml = "1.2.1"
-unicode-normalization = "0.1.26"
 ureq = { version = "3.5.2", features = ["json"] }
 
 [profile.release]

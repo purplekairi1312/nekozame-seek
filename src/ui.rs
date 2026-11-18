@@ -3,7 +3,7 @@
 //! screen never waits on it.
 
 use crate::api::{thousands, Slskd};
-use crate::library::{self, Todo};
+use crate::library::{self, Done};
 use crate::rank::{self, Entry, Sort};
 use crate::Config;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -38,21 +38,22 @@ enum Tab {
     Recent,
     Downloads,
     Library,
+    Sharing,
 }
 
-const TABS: [(Tab, &str); 5] = [
+const TABS: [(Tab, &str); 6] = [
     (Tab::Albums, "albums"),
     (Tab::Tracks, "tracks"),
     (Tab::Recent, "recent"),
     (Tab::Downloads, "downloads"),
     (Tab::Library, "library"),
+    (Tab::Sharing, "sharing"),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
     Search,
     Table,
-    Edit,
 }
 
 enum Msg {
@@ -87,18 +88,20 @@ struct App {
     inside: bool,
     past: Vec<Value>,
     transfers: Vec<Value>,
-    todo: Vec<Todo>,
-    notes: Vec<String>,
+    todo: Vec<Done>,
     skipped: HashSet<PathBuf>,
-    edit: String,
     toast: Option<(String, bool, Instant)>,
-    tables: [TableState; 5],
+    tables: [TableState; 6],
+    share_dir: Option<PathBuf>,
+    share_folders: Vec<PathBuf>,
+    shares: Option<crate::shares::Shares>,
     last_poll: Instant,
     last_transfers: Instant,
     last_status: Instant,
     last_library: Instant,
     history_at: Option<Instant>,
     quit: bool,
+    beets_now: Option<PathBuf>, // a download to hand to beets, with the screen given to it
 }
 
 pub fn run(cfg: Config, first: Option<String>) -> Result<(), String> {
@@ -129,17 +132,19 @@ pub fn run(cfg: Config, first: Option<String>) -> Result<(), String> {
         past: vec![],
         transfers: vec![],
         todo: vec![],
-        notes: vec![],
         skipped: HashSet::new(),
-        edit: String::new(),
         toast: None,
         tables: Default::default(),
+        share_dir: None,
+        share_folders: vec![],
+        shares: None,
         last_poll: long_ago,
         last_transfers: long_ago,
         last_status: long_ago,
         last_library: long_ago,
         history_at: Some(Instant::now()),
         quit: false,
+        beets_now: None,
     };
     if let Some(q) = first {
         app.query = q.clone();
@@ -150,6 +155,16 @@ pub fn run(cfg: Config, first: Option<String>) -> Result<(), String> {
     let result = (|| -> std::io::Result<()> {
         while !app.quit {
             app.tick();
+            if let (Some(path), Some(beet)) = (app.beets_now.take(), app.cfg.beets.clone()) {
+                // beets asks its questions in the terminal: the screen is its until it's done
+                ratatui::restore();
+                println!("\nbeets, for {} (its questions are its own; nekozame-seek comes back after)\n", path.display());
+                let ok = library::beets(&beet, &["import"], &path);
+                terminal = ratatui::init();
+                terminal.clear()?;
+                app.say(if ok { "beets put it in your library" } else { "it's still in downloads (beets skipped it, or you did)" }, !ok);
+                app.load_library();
+            }
             terminal.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(120))? {
                 if let Event::Key(k) = event::read()? {
@@ -266,7 +281,7 @@ impl App {
             self.history_at = None;
             self.background(|api| Msg::History(api.searches().unwrap_or_default()));
         }
-        if self.tab == Tab::Library && self.focus != Focus::Edit && now - self.last_library > Duration::from_secs(10) {
+        if self.tab == Tab::Library && now - self.last_library > Duration::from_secs(10) {
             self.load_library();
         }
         if self.toast.as_ref().is_some_and(|(_, _, t)| now - *t > Duration::from_secs(6)) {
@@ -306,37 +321,17 @@ impl App {
         });
     }
 
-    // --- the library tab
+    // --- the library tab: finished downloads, handed to beets
 
     fn load_library(&mut self) {
         self.last_library = Instant::now();
-        if !self.cfg.library.is_dir() || !self.cfg.downloads.is_dir() {
+        if !self.cfg.downloads.is_dir() {
             self.todo.clear();
             return;
         }
-        let kept: Vec<Todo> = std::mem::take(&mut self.todo);
-        for src in library::finished(&self.cfg.downloads, &self.transfers) {
-            if self.skipped.contains(&src) {
-                continue;
-            }
-            match kept.iter().position(|t| t.src == src) {
-                Some(i) => {
-                    let t = &kept[i]; // what you changed stays
-                    self.todo.push(Todo { src: t.src.clone(), kind: t.kind, artist: t.artist.clone(), dest: t.dest.clone(), sure: t.sure });
-                }
-                None => self.todo.push(library::guess(&self.cfg.library, &src)),
-            }
-        }
-        self.notes = self
-            .todo
-            .iter()
-            .map(|t| {
-                if t.dest.symlink_metadata().is_ok() {
-                    format!("{} (new: {})", library::quality_of(&t.dest), library::quality_of(&t.src))
-                } else {
-                    String::new()
-                }
-            })
+        self.todo = library::done(&self.cfg.downloads, &self.transfers)
+            .into_iter()
+            .filter(|d| !self.skipped.contains(&d.path))
             .collect();
         let t = &mut self.tables[App::idx(Tab::Library)];
         if self.todo.is_empty() {
@@ -346,39 +341,70 @@ impl App {
         }
     }
 
+    // --- the sharing tab: your folders, shared on Soulseek or not
+
+    fn load_sharing(&mut self) {
+        let Some(file) = &self.cfg.slskd_config else { return };
+        match crate::shares::Shares::read(file, self.cfg.slskd_paths.as_deref()) {
+            Ok(s) => {
+                if self.share_dir.is_none() {
+                    self.share_dir = s.shared.iter().find(|p| p.is_dir()).cloned();
+                }
+                self.shares = Some(s);
+            }
+            Err(e) => self.say(e, true),
+        }
+        self.share_folders = self.share_dir.as_deref().map(crate::shares::folders).unwrap_or_default();
+        let t = &mut self.tables[App::idx(Tab::Sharing)];
+        if self.share_folders.is_empty() {
+            t.select(None);
+        } else if t.selected().is_none_or(|i| i >= self.share_folders.len()) {
+            t.select(Some(0));
+        }
+    }
+
+    fn share_key(&mut self, code: KeyCode) {
+        let at = self.tables[App::idx(Tab::Sharing)].selected();
+        let here = at.and_then(|i| self.share_folders.get(i).cloned());
+        match code {
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(p) = here {
+                    self.share_dir = Some(p);
+                    self.tables[App::idx(Tab::Sharing)].select(Some(0));
+                    self.load_sharing();
+                }
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                if let Some(up) = self.share_dir.as_ref().and_then(|d| d.parent()).map(|p| p.to_path_buf()) {
+                    let from = self.share_dir.replace(up);
+                    self.load_sharing();
+                    if let Some(i) = self.share_folders.iter().position(|p| Some(p) == from.as_ref()) {
+                        self.tables[App::idx(Tab::Sharing)].select(Some(i));
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                let (Some(p), Some(s)) = (here, self.shares.as_mut()) else { return };
+                match s.toggle(&p) {
+                    Ok(what) => {
+                        self.say(format!("{what} (slskd is looking through your files again)"), false);
+                        self.background(|api| match api.rescan() {
+                            Ok(()) => Msg::Status(api.status()),
+                            Err(e) => Msg::Note(format!("slskd didn't look again: {e}"), true),
+                        });
+                    }
+                    Err(e) => self.say(e, true),
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn library_row(&self) -> Option<usize> {
         if self.todo.is_empty() {
             return None;
         }
         self.tables[App::idx(Tab::Library)].selected().map(|i| i.min(self.todo.len() - 1))
-    }
-
-    fn sort_one(&mut self, replace: bool, both: bool) {
-        let Some(i) = self.library_row() else { return };
-        let mut dest = self.todo[i].dest.clone();
-        if both && dest.symlink_metadata().is_ok() {
-            let (stem, ext) = match (dest.file_stem(), dest.extension()) {
-                (Some(s), Some(e)) if dest.is_file() => (s.to_string_lossy().to_string(), format!(".{}", e.to_string_lossy())),
-                _ => (dest.file_name().unwrap_or_default().to_string_lossy().to_string(), String::new()),
-            };
-            let mut n = 2;
-            while dest.with_file_name(format!("{stem} ({n}){ext}")).symlink_metadata().is_ok() {
-                n += 1;
-            }
-            dest = dest.with_file_name(format!("{stem} ({n}){ext}"));
-        }
-        if dest.symlink_metadata().is_ok() && !replace {
-            self.say("you have it already: o replaces it (the old one is kept aside), n keeps both", true);
-            return;
-        }
-        match library::move_to(&self.todo[i].src, &dest, replace) {
-            Ok(()) => {
-                let rel = dest.strip_prefix(&self.cfg.library).unwrap_or(&dest).display().to_string();
-                self.say(format!("in your library: {rel}"), false);
-            }
-            Err(e) => self.say(format!("not moved: {e}"), true),
-        }
-        self.load_library();
     }
 
     // --- keys
@@ -390,7 +416,6 @@ impl App {
         }
         match self.focus {
             Focus::Search => self.key_search(k),
-            Focus::Edit => self.key_edit(k),
             Focus::Table => self.key_table(k),
         }
     }
@@ -429,26 +454,6 @@ impl App {
         }
     }
 
-    fn key_edit(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => {
-                let new = self.edit.trim().trim_matches('/').to_string();
-                if let Some(i) = self.library_row() {
-                    if !new.is_empty() && !new.split('/').any(|p| p == "..") {
-                        self.todo[i].dest = self.cfg.library.join(new);
-                    }
-                }
-                self.focus = Focus::Table;
-                self.load_library();
-            }
-            KeyCode::Esc => self.focus = Focus::Table,
-            _ => {
-                let mut c = self.edit.chars().count();
-                edit_line(&mut self.edit, &mut c, k);
-            }
-        }
-    }
-
     fn rows(&self) -> usize {
         match self.tab {
             Tab::Albums => self.albums.len(),
@@ -456,10 +461,15 @@ impl App {
             Tab::Recent => self.past.len(),
             Tab::Downloads => self.transfers.iter().map(|u| u["directories"].as_array().map_or(0, |d| d.len())).sum(),
             Tab::Library => self.todo.len(),
+            Tab::Sharing => self.share_folders.len(),
         }
     }
 
     fn key_table(&mut self, k: KeyEvent) {
+        if self.tab == Tab::Sharing && matches!(k.code, KeyCode::Enter | KeyCode::Right | KeyCode::Left | KeyCode::Backspace | KeyCode::Char(' ')) {
+            self.share_key(k.code);
+            return;
+        }
         let n = self.rows();
         let t = &mut self.tables[App::idx(self.tab)];
         let at = t.selected().unwrap_or(0);
@@ -481,6 +491,10 @@ impl App {
             KeyCode::Char('d') => {
                 self.tab = Tab::Downloads;
                 self.last_transfers -= Duration::from_secs(10);
+            }
+            KeyCode::Char('h') => {
+                self.tab = Tab::Sharing;
+                self.load_sharing();
             }
             KeyCode::Char('l') => {
                 self.tab = Tab::Library;
@@ -510,40 +524,19 @@ impl App {
                     }
                 }
                 Tab::Recent => self.open_past(at),
-                Tab::Library => self.sort_one(false, false),
-                Tab::Downloads => {}
+                Tab::Library => match (self.library_row(), self.cfg.beets.is_some()) {
+                    (Some(i), true) => self.beets_now = Some(self.todo[i].path.clone()),
+                    (_, false) => self.say("putting downloads away needs beets: see docs/library.md", true),
+                    _ => {}
+                },
+                Tab::Downloads | Tab::Sharing => {}
             },
-            KeyCode::Char(c) if self.tab == Tab::Library => match c {
-                'e' => {
-                    if let Some(i) = self.library_row() {
-                        self.edit = self.todo[i].dest.strip_prefix(&self.cfg.library).unwrap_or(&self.todo[i].dest).display().to_string();
-                        self.focus = Focus::Edit;
-                    }
-                }
-                'k' => {
-                    if let Some(i) = self.library_row() {
-                        let t = &mut self.todo[i];
-                        t.kind = t.kind.next();
-                        let artist = if t.artist.is_empty() { "Unknown Artist".to_string() } else { t.artist.clone() };
-                        t.dest = library::destination(&self.cfg.library, t.kind, &artist, &t.src);
-                        self.load_library();
-                    }
-                }
-                'x' => {
-                    if let Some(i) = self.library_row() {
-                        self.skipped.insert(self.todo[i].src.clone());
-                        self.load_library();
-                    }
-                }
-                'u' => {
-                    let m = library::undo_last();
-                    self.say(m, false);
+            KeyCode::Char('x') if self.tab == Tab::Library => {
+                if let Some(i) = self.library_row() {
+                    self.skipped.insert(self.todo[i].path.clone());
                     self.load_library();
                 }
-                'o' => self.sort_one(true, false),
-                'n' => self.sort_one(false, true),
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -641,14 +634,15 @@ impl App {
             Tab::Recent => self.draw_recent(f, body),
             Tab::Downloads => self.draw_downloads(f, body),
             Tab::Library => self.draw_library(f, body),
+            Tab::Sharing => self.draw_sharing(f, body),
         }
 
         // the keys
         let keys: &[(&str, &str)] = match (self.focus, self.tab) {
             (Focus::Search, _) => &[("Enter", "search"), ("↑ ↓", "recent searches"), ("Esc", "to the list"), ("ctrl+c", "quit")],
-            (Focus::Edit, _) => &[("Enter", "keep it"), ("Esc", "never mind")],
-            (_, Tab::Library) => &[("Enter", "move it"), ("e", "change where"), ("k", "kind"), ("x", "leave it"), ("o", "replace"), ("n", "keep both"), ("u", "undo"), ("/", "search"), ("q", "quit")],
-            _ => &[("Enter", "download"), ("space", "what's inside"), ("b s f", "best / biggest / fastest"), ("a t r d l", "tabs"), ("/", "search"), ("q", "quit")],
+            (_, Tab::Library) => &[("Enter", "beets, for this one"), ("x", "leave it"), ("a t r d h", "tabs"), ("/", "search"), ("q", "quit")],
+            (_, Tab::Sharing) => &[("space", "share / don't share"), ("Enter →", "open"), ("←", "up"), ("a t r d l", "tabs"), ("q", "quit")],
+            _ => &[("Enter", "download"), ("space", "what's inside"), ("b s f", "best / biggest / fastest"), ("a t r d l h", "tabs"), ("/", "search"), ("q", "quit")],
         };
         let mut spans = vec![Span::raw(" ")];
         for (k, what) in keys {
@@ -676,7 +670,8 @@ impl App {
             Line::from(vec![s("  "), p("★"), s(" marks the best one, already picked: "), p("Enter"), s(" downloads it (an album: all of it).")]),
             Line::from(vec![s("  "), p("↑ ↓"), s(" to pick another, "), p("space"), s(" to see what's inside an album.")]),
             Line::from(""),
-            Line::from(vec![s("  "), p("recent"), s(" has your past searches, "), p("downloads"), s(" what's coming, and "), p("library"), s(" puts what's done in your library.")]),
+            Line::from(vec![s("  "), p("recent"), s(" has your past searches, "), p("downloads"), s(" what's coming, "), p("library"), s(" puts what's done in your library,")]),
+            Line::from(vec![s("  and "), p("sharing"), s(" is what others can download from you.")]),
         ];
         f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::default().style(Style::default().bg(BG))), area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
     }
@@ -847,59 +842,73 @@ impl App {
         f.render_stateful_widget(App::table(rows, H, w), area, &mut self.tables[3]);
     }
 
+    fn draw_sharing(&mut self, f: &mut Frame, area: Rect) {
+        use crate::shares::State;
+        let [help, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(3)]).areas(area);
+        let s = |t: &str| Span::styled(t.to_string(), Style::default().fg(MUTED));
+        let p = |t: &str| Span::styled(t.to_string(), Style::default().fg(PINK).add_modifier(Modifier::BOLD));
+        let text = match (&self.cfg.slskd_config, &self.share_dir) {
+            (None, _) => vec![Line::from(s(" set slskd_config in ~/.config/nekozame-seek/config.toml (on slskd's machine) to choose what you share here"))],
+            (_, None) => vec![Line::from(s(" nothing is shared yet, and no folder to start from"))],
+            (_, Some(dir)) => vec![
+                Line::from(vec![s(" what others can browse and download from you, in "), p(&dir.display().to_string())]),
+                Line::from(vec![s(" "), p("space"), s(": share it or not · "), p("Enter"), s(": open · "), p("←"), s(": up")]),
+            ],
+        };
+        f.render_widget(Paragraph::new(text), help);
+        let rows: Vec<Row> = self
+            .share_folders
+            .iter()
+            .map(|p| {
+                let (mark, what) = match self.shares.as_ref().map(|s| s.state(p)) {
+                    Some(State::Shared) => ("●", "shared"),
+                    Some(State::LeftOut) => ("○", "not shared"),
+                    Some(State::InLeftOut) => ("○", "not shared (its folder isn't)"),
+                    _ => ("·", "not shared"),
+                };
+                Row::new(vec![mark.to_string(), p.file_name().unwrap_or_default().to_string_lossy().to_string(), what.to_string()])
+            })
+            .collect();
+        let w = vec![Constraint::Length(1), Constraint::Fill(1), Constraint::Length(30)];
+        const H: &[&str] = &["", "folder", ""];
+        f.render_stateful_widget(App::table(rows, H, w), list, &mut self.tables[5]);
+    }
+
     fn draw_library(&mut self, f: &mut Frame, area: Rect) {
-        let editing = self.focus == Focus::Edit;
-        let [help, list, edit] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(if editing { 3 } else { 0 }),
-        ])
-        .areas(area);
+        let [help, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).areas(area);
         let p = |t: &str| Span::styled(t.to_string(), Style::default().fg(PINK).add_modifier(Modifier::BOLD));
         let s = |t: &str| Span::styled(t.to_string(), Style::default().fg(MUTED));
-        let first = if !self.cfg.library.is_dir() || !self.cfg.downloads.is_dir() {
-            Line::from(s(" the library tab sorts on the machine with the music: open nekozame-seek there"))
+        let text = if self.cfg.beets.is_none() {
+            vec![
+                Line::from(vec![s(" Putting downloads in your library needs "), p("beets"), s(": it matches them on MusicBrainz, fixes their tags")]),
+                Line::from(s(" and puts them where your library has them. Install it, and see docs/library.md.")),
+            ]
+        } else if !self.cfg.downloads.is_dir() {
+            vec![Line::from(s(" set downloads in ~/.config/nekozame-seek/config.toml (on the machine with the music)"))]
         } else {
-            Line::from(vec![
-                Span::styled(format!(" {} finished downloads", self.todo.len()), Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
-                s(" for your library. Here nothing moves until you say so (organize puts away the sure ones by itself); nothing is ever overwritten."),
-            ])
+            vec![
+                Line::from(vec![
+                    Span::styled(format!(" {} finished downloads", self.todo.len()), Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+                    s(" waiting for you (what beets is sure of goes by itself, with nekozame-seek organize)."),
+                ]),
+                Line::from(vec![s(" "), p("Enter"), s(": beets, for this one (it shows its match and asks you) · "), p("x"), s(": leave it")]),
+            ]
         };
-        let text = vec![
-            first,
-            Line::from(vec![s(" "), p("Enter"), s(": move it · "), p("e"), s(": change where · "), p("k"), s(": artist album / game / film / unsorted · "), p("x"), s(": leave it · "), p("u"), s(": undo the last move")]),
-            Line::from(vec![s(" "), p("!"), s(" you have it already · "), p("o"), s(": replace it (the old one is kept aside) · "), p("n"), s(": keep both")]),
-        ];
         f.render_widget(Paragraph::new(text), help);
-        let lib = self.cfg.library.clone();
         let rows: Vec<Row> = self
             .todo
             .iter()
-            .zip(&self.notes)
-            .map(|(t, note)| {
+            .map(|d| {
                 Row::new(vec![
-                    if note.is_empty() { "→".to_string() } else { "!".to_string() },
-                    t.src.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                    t.kind.name().to_string(),
-                    note.clone(),
-                    t.dest.strip_prefix(&lib).unwrap_or(&t.dest).display().to_string(),
+                    d.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    if d.soundtrack { "soundtrack".to_string() } else { "album".to_string() },
+                    d.quality.clone(),
                 ])
             })
             .collect();
-        let w = vec![Constraint::Length(1), Constraint::Fill(2), Constraint::Length(22), Constraint::Length(30), Constraint::Fill(3)];
-        const H: &[&str] = &["", "download", "is", "you have", "goes to"];
+        let w = vec![Constraint::Fill(1), Constraint::Length(12), Constraint::Length(18)];
+        const H: &[&str] = &["download", "looks like", "quality"];
         f.render_stateful_widget(App::table(rows, H, w), list, &mut self.tables[4]);
-        if editing {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(PINK))
-                .title(Span::styled(" where it goes, inside the library ", Style::default().fg(PINK)))
-                .style(Style::default().bg(DEEP));
-            f.render_widget(Paragraph::new(format!(" {}", self.edit)).block(block), edit);
-            let x = edit.x + 2 + self.edit.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum::<u16>();
-            f.set_cursor_position((x.min(edit.right().saturating_sub(2)), edit.y + 1));
-        }
     }
 }
 

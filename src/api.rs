@@ -85,6 +85,16 @@ impl Slskd {
         self.post(&format!("/transfers/downloads/{}", encode(user)), Value::Array(body)).map(|_| ())
     }
 
+    /// slskd looks through the shared folders again
+    pub fn rescan(&self) -> Result<(), String> {
+        self.agent
+            .put(&format!("{}/api/v0/shares", self.url))
+            .header("X-API-Key", &self.key)
+            .send_empty()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn downloads(&self) -> Result<Vec<Value>, String> {
         Ok(self.get("/transfers/downloads")?.as_array().cloned().unwrap_or_default())
     }
