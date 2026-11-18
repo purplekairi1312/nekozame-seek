@@ -1,39 +1,40 @@
 # nekozame-seek
 
-Soulseek in the terminal: search, pick and download from a TUI, while [slskd](https://github.com/slskd/slskd) stays logged in, shares and downloads on your server all the time. Open it over ssh, close it, and everything keeps going.
+A TUI for Soulseek, meant for servers and high-quality collections. [slskd](https://github.com/slskd/slskd) stays logged in on the server; nekozame-seek is where you search, pick and download, over ssh or anywhere.
 
-- Results come as albums (one user's folder), the best first: lossless before lossy, then the highest bit depth (32 before 24 before 16), then the highest sample rate, then the biggest in MB
-- The size only counts the audio files, so a folder with big scans, a booklet or a second copy in MP3 doesn't win for it
-- The best album is picked: Enter downloads the whole folder (music, cover, log)
-- `space` shows what's inside the album you're on: every file, with its bit depth, sample rate, length and size. Albums whose tracks aren't all the same quality say `mixed`
-- Single songs on the tracks tab, ranked the same way: Enter downloads just that one
-- Your recent searches on the recent tab (`r`), from any machine, as slskd keeps them: Enter opens one with its results, without searching again. `↑` and `↓` in the search box go through them too
-- `b`, `s` and `f` sort best first, biggest or fastest; `a`, `t`, `r` and `d` go to albums, tracks, recent searches or downloads; `/` searches again; `q` quits
-- In nekozame colours
+- Albums best first: lossless, then the highest bit depth, sample rate and size (only the music counts). Enter downloads the one picked
+- Tracks on their own tab, `space` shows what's inside an album, and your recent searches are kept
+- The library tab moves finished downloads into your library, one at a time after you've seen where to: never over anything, and every move can be undone
+- In [nekozame colours](https://git.sr.ht/~purplekairi1312/nekozame-theme)
 
 ## Install
 
-It needs a running slskd, and Python 3.11 or newer.
+It needs Python 3.11 or newer.
 
 ```sh
 git clone https://git.sr.ht/~purplekairi1312/nekozame-seek
 nekozame-seek/install.sh
 ```
 
-Without Python's venv (Debian's `python3-venv`), bring Textual's wheels from another machine (`pip download textual -d wheels`) and run `install.sh wheels`.
+Then, in slskd's `slskd.yml`, give it an API key (any long random text) that can search and download:
 
-Then `nekozame-seek`, or `nekozame-seek "artist album"` to search straight away.
-
-## Settings
-
-`~/.config/nekozame-seek/config.toml`:
-
-```toml
-url = "http://localhost:5030"   # slskd's address; from another machine, its Tailscale name
-api_key = "..."                 # an slskd API key with the readwrite role
+```yaml
+web:
+  authentication:
+    api_keys:
+      nekozame_seek:
+        key: PUT-A-LONG-RANDOM-KEY-HERE
+        role: readwrite
 ```
 
-On slskd's own machine the key is read from `~/slskd/app/slskd.yml` (an API key called `nekozame_seek`) when it isn't set here.
+And tell nekozame-seek about it, in `~/.config/nekozame-seek/config.toml`:
+
+```toml
+url = "http://localhost:5030"   # slskd's address
+api_key = "PUT-A-LONG-RANDOM-KEY-HERE"
+downloads = "/path/to/slskd/downloads"   # for the library tab
+library = "/path/to/your/music"
+```
 
 ## License
 
