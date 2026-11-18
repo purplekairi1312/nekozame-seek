@@ -9,11 +9,10 @@ A TUI for Soulseek, meant for servers and high-quality collections. [slskd](http
 
 ## Install
 
-It needs Python 3.11 or newer.
+One file: download yours from the [releases](https://github.com/purplekairi1312/nekozame-seek/releases) (GNU/Linux on x86-64 or ARM, macOS on Apple silicon), make it executable and put it in your PATH. Or build it with Rust:
 
 ```sh
-git clone https://git.sr.ht/~purplekairi1312/nekozame-seek
-nekozame-seek/install.sh
+cargo install --git https://git.sr.ht/~purplekairi1312/nekozame-seek
 ```
 
 Then, in slskd's `slskd.yml`, give it an API key (any long random text) that can search and download:
