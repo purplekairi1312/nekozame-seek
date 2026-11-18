@@ -127,7 +127,31 @@ def albums(responses):
                 "lossless": bool(lossless), "depth": depth, "rate": rate,
                 "bitrate": max((f.get("bitRate") or 0) for f in main),
                 "mb": sum(f["size"] for f in main) / 1e6,
-                "format": "/".join(sorted({ext(f).upper() for f in main})),
+                "format": "/".join(sorted({ext(f).upper() for f in main}))
+                          + (" mixed" if len({(f.get("bitDepth"), f.get("sampleRate")) for f in main}) > 1 else ""),
+                "free": r.get("hasFreeUploadSlot", False), "speed": r.get("uploadSpeed") or 0,
+                "queue": r.get("queueLength") or 0,
+            })
+    return out
+
+
+def tracks(responses):
+    """every music file on its own (for singles and single tracks), ranked like albums"""
+    out = []
+    for r in responses:
+        for f in r.get("files") or []:
+            e = ext(f)
+            if e not in AUDIO:
+                continue
+            lossless = e in LOSSLESS
+            depth, rate = f.get("bitDepth") or 0, f.get("sampleRate") or 0
+            if lossless and not depth:
+                depth, rate = 16, rate or 44100
+            out.append({
+                "user": r["username"], "path": folder(f["filename"]), "files": [f], "audio": [f],
+                "name": re.split(r"[\\/]", f["filename"])[-1], "length": f.get("length") or 0,
+                "lossless": lossless, "depth": depth, "rate": rate, "bitrate": f.get("bitRate") or 0,
+                "mb": f["size"] / 1e6, "format": e.upper(),
                 "free": r.get("hasFreeUploadSlot", False), "speed": r.get("uploadSpeed") or 0,
                 "queue": r.get("queueLength") or 0,
             })
@@ -158,19 +182,19 @@ def title(a):
 
 HELP = """[b #ffc0e5]How it works[/]
 
-  Type what you're looking for (artist and album) and press [b]Enter[/].
+  Type what you're looking for (artist and album, or a song) and press [b]Enter[/].
 
-  Albums come in best first:
+  Albums are on the [b]albums[/] tab, single songs on [b]tracks[/]. Both come in best first:
     [#ffd4ee]1.[/] lossless (FLAC, WAV…) before lossy (MP3…)
     [#ffd4ee]2.[/] the highest bit depth: 32, then 24, then 16
     [#ffd4ee]3.[/] the highest sample rate: 192 kHz, then 96, then 48, then 44.1
     [#ffd4ee]4.[/] the biggest, counting only the music
 
-  [b #ffc0e5]★[/] marks the best one, already picked: [b]Enter[/] downloads the whole album.
+  [b #ffc0e5]★[/] marks the best one, already picked: [b]Enter[/] downloads it (an album: all of it).
   [b]↑ ↓[/] to pick another.
 
-  [#b3a7cb]b / s / f  best first / biggest / fastest      d  downloads
-  /  search again                                q  quit[/]
+  [#b3a7cb]space  what's inside the album        b / s / f  best first / biggest / fastest
+  a / t / d  albums / tracks / downloads      /  search again      q  quit[/]
 """
 
 
@@ -206,17 +230,22 @@ def tui(first_search=None):
         DataTable > .datatable--header { background: #433a55; color: #ffc0e5; text-style: bold; }
         DataTable > .datatable--cursor { background: #ffc0e5; color: #433a55; text-style: bold; }
         DataTable > .datatable--hover { background: #685c7f; }
+        #inside { height: 14; margin: 0 1; background: #433a55; border-top: solid #ffc0e5; }
+        #inside > .datatable--header { background: #433a55; color: #ffc0e5; text-style: bold; }
         Footer { background: #433a55; color: #e8def5; }
         FooterKey { background: #433a55; }
         FooterKey .footer-key--key { background: #433a55; color: #ffc0e5; text-style: bold; }
         FooterKey .footer-key--description { background: #433a55; color: #e8def5; }
         """
         BINDINGS = [
+            Binding("space", "inside", "what's inside"),
             Binding("b", "sort('quality')", "best first"),
             Binding("s", "sort('size')", "biggest"),
             Binding("f", "sort('speed')", "fastest"),
             Binding("slash", "focus_search", "new search"),
-            Binding("d", "show_downloads", "downloads"),
+            Binding("a", "tab('albums')", "albums"),
+            Binding("t", "tab('tracks')", "tracks"),
+            Binding("d", "tab('downloads')", "downloads"),
             Binding("q", "quit", "quit"),
             Binding("ctrl+c", "quit", "quit", show=False),
         ]
@@ -226,22 +255,30 @@ def tui(first_search=None):
             with Horizontal(id="top"):
                 yield Static("🦈 nekozame-seek", id="title")
                 yield Static("…", id="status")
-            with TabbedContent(initial="search"):
-                with TabPane("search", id="search"):
+            yield Input(placeholder="search Soulseek: artist and album, or a song, then Enter", id="query")
+            yield Static("", id="summary")
+            with TabbedContent(initial="albums"):
+                with TabPane("albums", id="albums"):
                     with Vertical():
-                        yield Input(placeholder="search Soulseek: artist and album, then Enter", id="query")
-                        yield Static("", id="summary")
                         yield Static(HELP, id="help")
                         yield DataTable(id="results", cursor_type="row")
+                        yield DataTable(id="inside", cursor_type="none", show_cursor=False)
+                with TabPane("tracks", id="tracks"):
+                    yield DataTable(id="songs", cursor_type="row")
                 with TabPane("downloads", id="downloads"):
                     yield DataTable(id="transfers", cursor_type="row")
             yield Footer()
 
         def on_mount(self):
-            self.sort, self.found, self.sid, self.searching = "quality", [], None, False
+            self.sort, self.found, self.singles, self.sid, self.searching = "quality", [], [], None, False
             res = self.query_one("#results", DataTable)
             res.add_columns("", "bits", "kHz", "format", "size", "tracks", "from", "can start", "album")
             res.display = False
+            inside = self.query_one("#inside", DataTable)
+            inside.add_columns("", "file", "bits", "kHz", "length", "size")
+            inside.display = False
+            self.query_one("#songs", DataTable).add_columns("", "bits", "kHz", "format", "size", "length",
+                                                             "from", "can start", "track", "in")
             self.query_one("#transfers", DataTable).add_columns("album", "from", "tracks", "done", "state")
             self.set_interval(1.0, self.poll)
             self.set_interval(3.0, self.poll_downloads)
@@ -258,30 +295,34 @@ def tui(first_search=None):
 
         def start(self, text):
             try:
-                self.sid, self.found, self.searching, self.text = api.search(text), [], True, text
+                self.sid, self.found, self.singles, self.searching, self.text = api.search(text), [], [], True, text
             except (OSError, ValueError, KeyError) as e:
                 self.query_one("#summary", Static).update(f"couldn't search: {e}")
                 return
             self.query_one("#help", Static).display = False
+            self.query_one("#inside", DataTable).display = False
             res = self.query_one("#results", DataTable)
             res.display = True
             self.show()
-            res.focus()
+            (res if self.query_one(TabbedContent).active != "tracks" else self.query_one("#songs", DataTable)).focus()
 
         def on_input_submitted(self, event):
             if event.value.strip():
                 self.start(event.value.strip())
 
         def on_data_table_row_selected(self, event):
-            if event.data_table.id == "results":
-                self.download(event.cursor_row)
+            if event.data_table.id == "results" and self.found:
+                self.download(self.found[event.cursor_row])
+            elif event.data_table.id == "songs" and self.singles:
+                self.download(self.singles[event.cursor_row])
 
         def poll(self):
             if not self.sid or not self.searching:
                 return
             try:
                 state = api.search_state(self.sid)
-                self.found = albums(api.responses(self.sid))
+                got = api.responses(self.sid)
+                self.found, self.singles = albums(got), tracks(got)
             except (OSError, ValueError):
                 return
             self.searching = not state.get("isComplete")
@@ -300,37 +341,83 @@ def tui(first_search=None):
                             "now" if a["free"] else f"{a['queue']} in line", title(a), key=str(i))
             if self.found:
                 res.move_cursor(row=min(at, len(self.found) - 1))
+            songs = self.query_one("#songs", DataTable)
+            at = songs.cursor_row if keep_cursor else 0
+            self.singles.sort(key=SORTS[self.sort], reverse=True)
+            songs.clear()
+            for i, a in enumerate(self.singles[:600]):
+                bits = str(a["depth"]) if a["lossless"] else f"{a['bitrate']}k" if a["bitrate"] else "?"
+                khz = f"{a['rate'] / 1000:g}" if a["rate"] else ""
+                n = a["length"]
+                songs.add_row("★" if i == 0 and self.sort == "quality" else "", bits, khz, a["format"],
+                              f"{a['mb']:,.1f} MB", f"{n // 60}:{n % 60:02d}" if n else "", a["user"][:18],
+                              "now" if a["free"] else f"{a['queue']} in line", a["name"], title(a), key=str(i))
+            if self.singles:
+                songs.move_cursor(row=min(at, len(self.singles) - 1))
             how = {"quality": "best first", "size": "biggest first", "speed": "fastest first"}[self.sort]
+            counts = f"{len(self.found)} albums and {len(self.singles):,} tracks"
             if self.searching:
-                text = f"searching for “{self.text}”… {len(self.found)} albums so far, {how}"
-            elif self.found:
-                text = f"{len(self.found)} albums for “{self.text}”, {how} · Enter downloads the one picked"
+                text = f"searching for “{self.text}”… {counts} so far, {how}"
+            elif self.found or self.singles:
+                text = f"{counts} for “{self.text}”, {how} · Enter downloads the one picked"
             else:
                 text = f"nothing found for “{self.text}”: try fewer words"
             self.query_one("#summary", Static).update(text)
+
+        def action_inside(self):
+            """the album's files, under the results; again to close"""
+            inside = self.query_one("#inside", DataTable)
+            inside.display = not inside.display and bool(self.found)
+            self.fill_inside()
+
+        def on_data_table_row_highlighted(self, event):
+            if event.data_table.id == "results":
+                self.fill_inside()
+
+        def fill_inside(self):
+            inside = self.query_one("#inside", DataTable)
+            if not inside.display or not self.found:
+                return
+            a = self.found[min(self.query_one("#results", DataTable).cursor_row, len(self.found) - 1)]
+            inside.clear()
+            music = [f for f in a["files"] if f in a["audio"]]
+            rest = [f for f in a["files"] if f not in a["audio"]]
+            for f in sorted(music, key=lambda f: f["filename"]) + sorted(rest, key=lambda f: f["filename"]):
+                name = re.split(r"[\\/]", f["filename"])[-1]
+                length = f.get("length") or 0
+                if f in a["audio"]:
+                    bits = str(f.get("bitDepth") or "") if ext(f) in LOSSLESS else f"{f.get('bitRate') or '?'}k"
+                    khz = f"{f['sampleRate'] / 1000:g}" if f.get("sampleRate") else ""
+                    mark = "♪"
+                else:
+                    bits = khz = ""
+                    mark = "·"
+                inside.add_row(mark, name, bits, khz, f"{length // 60}:{length % 60:02d}" if length else "",
+                               f"{f['size'] / 1e6:,.1f} MB")
 
         def action_sort(self, how):
             self.sort = how
             self.show()
 
         def action_focus_search(self):
-            self.query_one(TabbedContent).active = "search"
             self.query_one("#query", Input).focus()
 
-        def action_show_downloads(self):
-            self.query_one(TabbedContent).active = "downloads"
-            self.poll_downloads()
+        def action_tab(self, tab):
+            self.query_one(TabbedContent).active = tab
+            table = {"albums": "#results", "tracks": "#songs", "downloads": "#transfers"}[tab]
+            self.query_one(table, DataTable).focus()
+            if tab == "downloads":
+                self.poll_downloads()
 
-        def download(self, row):
-            if not self.found:
-                return
-            a = self.found[row]
+        def download(self, a):
+            """an album: the whole folder (the music, its cover, the log); a track: that file"""
             try:
-                api.download(a["user"], a["files"])  # the whole folder: the music, its cover, the log
+                api.download(a["user"], a["files"])
             except (OSError, ValueError) as e:
                 self.notify(f"couldn't queue it: {e}", severity="error")
                 return
-            self.notify(f"downloading {title(a)}: {a['mb']:,.0f} MB, {quality(a)} {a['format']}, from {a['user']} (d shows it)")
+            what = a.get("name") or title(a)
+            self.notify(f"downloading {what}: {a['mb']:,.1f} MB, {quality(a)} {a['format']}, from {a['user']} (d shows it)")
 
         def poll_downloads(self):
             if self.query_one(TabbedContent).active != "downloads":

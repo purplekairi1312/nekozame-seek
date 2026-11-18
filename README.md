@@ -5,7 +5,9 @@ Soulseek in the terminal: search, pick and download from a TUI, while [slskd](ht
 - Results come as albums (one user's folder), the best first: lossless before lossy, then the highest bit depth (32 before 24 before 16), then the highest sample rate, then the biggest in MB
 - The size only counts the audio files, so a folder with big scans, a booklet or a second copy in MP3 doesn't win for it
 - The best album is picked: Enter downloads the whole folder (music, cover, log)
-- `b`, `s` and `f` sort best first, biggest or fastest; `/` searches again; `d` shows the downloads; `q` quits
+- `space` shows what's inside the album you're on: every file, with its bit depth, sample rate, length and size. Albums whose tracks aren't all the same quality say `mixed`
+- Single songs on the tracks tab, ranked the same way: Enter downloads just that one
+- `b`, `s` and `f` sort best first, biggest or fastest; `a`, `t` and `d` go to albums, tracks or downloads; `/` searches again; `q` quits
 - In nekozame colours
 
 ## Install
