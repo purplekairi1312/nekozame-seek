@@ -78,6 +78,8 @@ struct App {
     sort: Sort,
     sid: Option<String>,
     text: String,
+    wanted: Option<String>, // what you typed, when Soulseek wouldn't search it as it is
+    fallbacks: Vec<String>, // the other ways of asking still to try
     searching: bool,
     polling: bool,
     albums: Vec<Entry>,
@@ -117,6 +119,8 @@ pub fn run(cfg: Config, first: Option<String>) -> Result<(), String> {
         sort: Sort::Quality,
         sid: None,
         text: String::new(),
+        wanted: None,
+        fallbacks: vec![],
         searching: false,
         polling: false,
         albums: vec![],
@@ -202,9 +206,28 @@ impl App {
                     if self.sid.as_deref() == Some(id.as_str()) {
                         self.albums = rank::albums(&responses);
                         self.tracks = rank::tracks(&responses);
+                        if let Some(w) = &self.wanted {
+                            self.albums.retain(|e| matches(e, w));
+                            self.tracks.retain(|e| matches(e, w));
+                        }
                         rank::sort(&mut self.albums, self.sort);
                         rank::sort(&mut self.tracks, self.sort);
                         self.searching = !done;
+                        // nothing at all: the Soulseek server won't pass on searches for some
+                        // artists and titles (The Beatles, Selected Ambient Works…, at rights
+                        // holders' request), though the files are shared. asked other ways
+                        // ("*eatles"), then only what matches everything typed is shown
+                        if done && responses.is_empty() {
+                            if self.wanted.is_none() {
+                                self.wanted = Some(self.text.clone());
+                                self.fallbacks = other_ways(&self.text);
+                            }
+                            if !self.fallbacks.is_empty() {
+                                let t = self.fallbacks.remove(0);
+                                self.searching = true; // still going, as far as you're concerned
+                                self.background(move |api| Msg::Started(api.search(&t), t.clone()));
+                            }
+                        }
                         for (tab, n) in [(Tab::Albums, self.albums.len()), (Tab::Tracks, self.tracks.len())] {
                             let t = &mut self.tables[App::idx(tab)];
                             if n == 0 {
@@ -253,6 +276,7 @@ impl App {
 
     fn start(&mut self, text: String) {
         self.back = None;
+        self.wanted = None;
         let t = text.clone();
         self.background(move |api| Msg::Started(api.search(&t), t.clone()));
     }
@@ -264,6 +288,7 @@ impl App {
         self.cursor = text.chars().count();
         self.sid = Some(id);
         self.text = text;
+        self.wanted = None;
         self.searching = true; // one look: slskd still has its results
         self.albums.clear();
         self.tracks.clear();
@@ -577,13 +602,18 @@ impl App {
         } else if self.sid.is_some() {
             let counts = format!("{} albums and {} tracks", self.albums.len(), thousands(self.tracks.len() as u64));
             let how = self.sort.describe();
+            let typed = self.wanted.clone().unwrap_or_else(|| self.text.clone());
+            let note = match &self.wanted {
+                Some(_) => format!(" (Soulseek won't search it whole, so: “{}”, then what matches)", self.text),
+                None => String::new(),
+            };
             Span::styled(
                 if self.searching {
-                    format!(" searching for “{}”… {counts} so far, {how}", self.text)
+                    format!(" searching for “{typed}”… {counts} so far, {how}{note}")
                 } else if self.albums.is_empty() && self.tracks.is_empty() {
-                    format!(" nothing found for “{}”: try fewer words", self.text)
+                    format!(" nothing found for “{typed}”: try other words{note}")
                 } else {
-                    format!(" {counts} for “{}”, {how} · Enter downloads the one picked", self.text)
+                    format!(" {counts} for “{typed}”, {how}{note} · Enter downloads the one picked")
                 },
                 Style::default().fg(SOFT),
             )
@@ -896,4 +926,53 @@ fn edit_line(text: &mut String, cursor: &mut usize, k: KeyEvent) {
         _ => {}
     }
     *text = chars.into_iter().collect();
+}
+
+/// whether an album or track has every word typed in its folders or file names (in any case,
+/// with or without spaces and punctuation)
+fn matches(e: &Entry, wanted: &str) -> bool {
+    let squash = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
+    let mut hay = squash(&e.path.join(" "));
+    for f in &e.files {
+        hay.push_str(&squash(f.name()));
+    }
+    wanted
+        .split_whitespace()
+        .filter(|w| !SMALL.contains(&w.to_lowercase().as_str()))
+        .map(squash)
+        .filter(|w| !w.is_empty())
+        .all(|w| hay.contains(&w))
+}
+
+/// words left out of matching and starring: folders often drop them ("Beatles - Abbey Road")
+const SMALL: &[&str] = &["the", "a", "an", "and", "of", "&"];
+
+/// other ways to ask Soulseek for the same thing, in order: each longer word's first letter
+/// as a wildcard (the server's blocked list doesn't catch "*eatles"), then fewer words of that
+fn other_ways(text: &str) -> Vec<String> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .filter(|w| !SMALL.contains(&w.to_lowercase().as_str()))
+        .map(|w| {
+            let chars: Vec<char> = w.chars().collect();
+            if chars.len() >= 5 { format!("*{}", chars[1..].iter().collect::<String>()) } else { w.to_string() }
+        })
+        .collect();
+    let mut out: Vec<String> = (1..=words.len()).rev().map(|n| words[..n].join(" ")).collect();
+    out.retain(|w| w.contains('*') && w != text); // a search with no wildcard was blocked already
+    out.dedup();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ways_round_blocked_searches() {
+        assert_eq!(other_ways("the beatles"), ["*eatles"]);
+        assert_eq!(other_ways("The Beatles Abbey Road"), ["*eatles *bbey Road", "*eatles *bbey", "*eatles"]);
+        assert_eq!(other_ways("aphex twin selected ambient works")[0], "*phex twin *elected *mbient *orks");
+        assert_eq!(other_ways("aphex twin selected ambient works").last().unwrap(), "*phex");
+    }
 }

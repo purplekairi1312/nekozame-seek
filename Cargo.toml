@@ -1,6 +1,6 @@
 [package]
 name = "nekozame-seek"
-version = "1.0.0"
+version = "1.1.0"
 description = "A TUI for Soulseek, meant for servers and high-quality collections"
 license = "GPL-3.0-or-later"
 repository = "https://git.sr.ht/~purplekairi1312/nekozame-seek"
