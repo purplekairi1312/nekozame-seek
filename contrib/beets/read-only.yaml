@@ -7,4 +7,5 @@ import:
   write: no
   autotag: no
   quiet: yes
+  duplicate_action: skip   # read already: not added twice
 plugins: musicbrainz
