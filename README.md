@@ -7,7 +7,8 @@ Soulseek in the terminal: search, pick and download from a TUI, while [slskd](ht
 - The best album is picked: Enter downloads the whole folder (music, cover, log)
 - `space` shows what's inside the album you're on: every file, with its bit depth, sample rate, length and size. Albums whose tracks aren't all the same quality say `mixed`
 - Single songs on the tracks tab, ranked the same way: Enter downloads just that one
-- `b`, `s` and `f` sort best first, biggest or fastest; `a`, `t` and `d` go to albums, tracks or downloads; `/` searches again; `q` quits
+- Your recent searches on the recent tab (`r`), from any machine, as slskd keeps them: Enter opens one with its results, without searching again. `↑` and `↓` in the search box go through them too
+- `b`, `s` and `f` sort best first, biggest or fastest; `a`, `t`, `r` and `d` go to albums, tracks, recent searches or downloads; `/` searches again; `q` quits
 - In nekozame colours
 
 ## Install

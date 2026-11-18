@@ -81,6 +81,10 @@ class Slskd:
     def search(self, text):
         return self.call("POST", "/searches", {"searchText": text})["id"]
 
+    def searches(self):
+        """the searches slskd keeps (from any machine), newest first"""
+        return sorted(self.call("GET", "/searches") or [], key=lambda x: x.get("startedAt") or "", reverse=True)
+
     def search_state(self, sid):
         return self.call("GET", f"/searches/{sid}")
 
@@ -96,6 +100,16 @@ class Slskd:
 
 
 # --- albums: the results, grouped and ranked ---------------------------------------------
+
+def local_time(stamp):
+    """slskd's UTC time, in this machine's time"""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(stamp[:19]).replace(tzinfo=__import__("datetime").timezone.utc) \
+            .astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return ""
+
 
 def folder(path):
     return re.split(r"[\\/]", path)[:-1]
@@ -194,7 +208,8 @@ HELP = """[b #ffc0e5]How it works[/]
   [b]↑ ↓[/] to pick another.
 
   [#b3a7cb]space  what's inside the album        b / s / f  best first / biggest / fastest
-  a / t / d  albums / tracks / downloads      /  search again      q  quit[/]
+  a / t / r / d  albums / tracks / recent searches / downloads
+  /  search again (↑ ↓ in the box: your recent ones)      q  quit[/]
 """
 
 
@@ -245,6 +260,7 @@ def tui(first_search=None):
             Binding("slash", "focus_search", "new search"),
             Binding("a", "tab('albums')", "albums"),
             Binding("t", "tab('tracks')", "tracks"),
+            Binding("r", "tab('recent')", "recent"),
             Binding("d", "tab('downloads')", "downloads"),
             Binding("q", "quit", "quit"),
             Binding("ctrl+c", "quit", "quit", show=False),
@@ -265,6 +281,8 @@ def tui(first_search=None):
                         yield DataTable(id="inside", cursor_type="none", show_cursor=False)
                 with TabPane("tracks", id="tracks"):
                     yield DataTable(id="songs", cursor_type="row")
+                with TabPane("recent", id="recent"):
+                    yield DataTable(id="history", cursor_type="row")
                 with TabPane("downloads", id="downloads"):
                     yield DataTable(id="transfers", cursor_type="row")
             yield Footer()
@@ -279,6 +297,9 @@ def tui(first_search=None):
             inside.display = False
             self.query_one("#songs", DataTable).add_columns("", "bits", "kHz", "format", "size", "length",
                                                              "from", "can start", "track", "in")
+            self.query_one("#history", DataTable).add_columns("search", "when", "results from", "files")
+            self.past, self.back = [], -1
+            self.load_history()
             self.query_one("#transfers", DataTable).add_columns("album", "from", "tracks", "done", "state")
             self.set_interval(1.0, self.poll)
             self.set_interval(3.0, self.poll_downloads)
@@ -306,15 +327,52 @@ def tui(first_search=None):
             self.show()
             (res if self.query_one(TabbedContent).active != "tracks" else self.query_one("#songs", DataTable)).focus()
 
+        def load_history(self):
+            try:
+                self.past = api.searches()
+            except (OSError, ValueError):
+                return
+            t = self.query_one("#history", DataTable)
+            t.clear()
+            for x in self.past:
+                when = local_time(x.get("startedAt"))
+                t.add_row(x.get("searchText", ""), when, f"{x.get('responseCount', 0)} users",
+                          f"{x.get('fileCount', 0):,}")
+
+        def open_past(self, x):
+            """an old search, with its results as slskd kept them: no searching again"""
+            self.query_one("#query", Input).value = x["searchText"]
+            self.sid, self.text, self.searching = x["id"], x["searchText"], True
+            self.query_one("#help", Static).display = False
+            self.query_one("#inside", DataTable).display = False
+            self.query_one("#results", DataTable).display = True
+            self.action_tab("albums")
+            self.poll()
+
+        def on_key(self, event):
+            """↑ ↓ in the search box: your recent searches"""
+            box = self.query_one("#query", Input)
+            if not box.has_focus or event.key not in ("up", "down") or not self.past:
+                return
+            texts = list(dict.fromkeys(x.get("searchText", "") for x in self.past))
+            self.back = min(self.back + 1, len(texts) - 1) if event.key == "up" else max(self.back - 1, -1)
+            box.value = texts[self.back] if self.back >= 0 else ""
+            box.cursor_position = len(box.value)
+            event.stop()
+
         def on_input_submitted(self, event):
             if event.value.strip():
+                self.back = -1
                 self.start(event.value.strip())
+                self.set_timer(2.0, self.load_history)
 
         def on_data_table_row_selected(self, event):
             if event.data_table.id == "results" and self.found:
                 self.download(self.found[event.cursor_row])
             elif event.data_table.id == "songs" and self.singles:
                 self.download(self.singles[event.cursor_row])
+            elif event.data_table.id == "history" and self.past:
+                self.open_past(self.past[event.cursor_row])
 
         def poll(self):
             if not self.sid or not self.searching:
@@ -404,7 +462,9 @@ def tui(first_search=None):
 
         def action_tab(self, tab):
             self.query_one(TabbedContent).active = tab
-            table = {"albums": "#results", "tracks": "#songs", "downloads": "#transfers"}[tab]
+            table = {"albums": "#results", "tracks": "#songs", "recent": "#history", "downloads": "#transfers"}[tab]
+            if tab == "recent":
+                self.load_history()
             self.query_one(table, DataTable).focus()
             if tab == "downloads":
                 self.poll_downloads()
