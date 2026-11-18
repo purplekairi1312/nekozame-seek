@@ -1,0 +1,7 @@
+[Unit]
+Description=nekozame-seek: finished downloads into the library (the sure ones)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nekozame-seek organize

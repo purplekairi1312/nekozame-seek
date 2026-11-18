@@ -1,0 +1,10 @@
+# copy both to ~/.config/systemd/user/, then: systemctl --user enable --now nekozame-seek-organize.timer
+[Unit]
+Description=nekozame-seek: finished downloads into the library, every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

@@ -5,7 +5,7 @@ A TUI for Soulseek, meant for servers and high-quality collections. [slskd](http
 - Albums best pick first: lossless, then the highest bit depth, sample rate and size (only the music files counts). Enter downloads the one picked
 - Finds what Soulseek blocks searches for (The Beatles, some album titles): it asks again another way (`*eatles`) and keeps what matches what you typed
 - Individual tracks on their own tab, `space` shows what's inside an album, and your recent searches are kept
-- The library tab moves finished downloads into your library, one at a time after you've seen where to: never over anything, and every move can be undone
+- Finished downloads into your library, the way it's organized: the sure ones by themselves (`nekozame-seek organize`, from a timer), the rest in the library tab after you've seen where to. Never over anything, and every move can be undone
 - In [nekozame colours](https://git.sr.ht/~purplekairi1312/nekozame-theme)
 
 ## Install
@@ -35,6 +35,8 @@ api_key = "PUT-A-LONG-RANDOM-KEY-HERE"
 downloads = "/path/to/slskd/downloads"   # for the library tab
 library = "/path/to/your/music"
 ```
+
+To put finished downloads away by themselves, run `nekozame-seek organize` every few minutes, for example from a systemd timer (`contrib/` has one) or cron.
 
 ## License
 

@@ -14,6 +14,9 @@ const HELP: &str = "nekozame-seek: a TUI for Soulseek, meant for servers and hig
 
   nekozame-seek                 open it
   nekozame-seek \"artist album\"  open it, searching straight away
+  nekozame-seek organize        put away the finished downloads it's sure about (artist
+                                albums with tags, not in the library yet), for a timer;
+                                the rest wait in the library tab
 
 Settings: ~/.config/nekozame-seek/config.toml
   url = \"http://localhost:5030\"            slskd's address
@@ -56,6 +59,18 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
+        return;
+    }
+    if args.first().is_some_and(|a| a == "organize") {
+        let cfg = config();
+        let api = api::Slskd::new(&cfg.url, &cfg.api_key);
+        match library::organize(&cfg, &api) {
+            Ok(lines) => lines.iter().for_each(|l| println!("{l}")),
+            Err(e) => {
+                eprintln!("nekozame-seek organize: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     let first = if args.is_empty() { None } else { Some(args.join(" ")) };

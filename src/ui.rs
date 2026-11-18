@@ -322,7 +322,7 @@ impl App {
             match kept.iter().position(|t| t.src == src) {
                 Some(i) => {
                     let t = &kept[i]; // what you changed stays
-                    self.todo.push(Todo { src: t.src.clone(), kind: t.kind, artist: t.artist.clone(), dest: t.dest.clone() });
+                    self.todo.push(Todo { src: t.src.clone(), kind: t.kind, artist: t.artist.clone(), dest: t.dest.clone(), sure: t.sure });
                 }
                 None => self.todo.push(library::guess(&self.cfg.library, &src)),
             }
@@ -862,7 +862,7 @@ impl App {
         } else {
             Line::from(vec![
                 Span::styled(format!(" {} finished downloads", self.todo.len()), Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
-                s(" to put in your library. Nothing moves until you say so; nothing is ever overwritten."),
+                s(" for your library. Here nothing moves until you say so (organize puts away the sure ones by itself); nothing is ever overwritten."),
             ])
         };
         let text = vec![

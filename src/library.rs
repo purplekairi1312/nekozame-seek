@@ -55,6 +55,9 @@ pub struct Todo {
     pub kind: Kind,
     pub artist: String,
     pub dest: PathBuf,
+    /// sure enough to move without asking: an artist album, its artist from the music's tags
+    /// (not guessed from a folder name), and nothing there already
+    pub sure: bool,
 }
 
 static GAME: LazyLock<Regex> = LazyLock::new(|| {
@@ -135,6 +138,7 @@ pub fn guess(library: &Path, src: &Path) -> Todo {
     let (albumartist, trackartist, album, genre) = tags(src);
     let text = format!("{name} {album} {genre}");
     let mut artist = if albumartist.is_empty() { trackartist } else { albumartist };
+    let tagged = !artist.is_empty();
     if artist.is_empty() {
         if let Some(c) = ARTIST_NAME.captures(&name) {
             artist = c[1].to_string();
@@ -148,7 +152,8 @@ pub fn guess(library: &Path, src: &Path) -> Todo {
         Kind::Artist
     };
     let dest = destination(library, kind, &artist, src);
-    Todo { src: src.to_path_buf(), kind, artist, dest }
+    let sure = kind == Kind::Artist && tagged && dest.symlink_metadata().is_err();
+    Todo { src: src.to_path_buf(), kind, artist, dest, sure }
 }
 
 pub fn destination(library: &Path, kind: Kind, artist: &str, src: &Path) -> PathBuf {
@@ -307,6 +312,27 @@ pub fn move_to(src: &Path, dest: &Path, replace: bool) -> Result<(), String> {
     });
     writeln!(f, "{line}").map_err(e)?;
     Ok(())
+}
+
+/// the finished downloads it's sure about, put away without asking (nekozame-seek organize,
+/// from a timer); the rest wait in the library tab. what moved, one line each
+pub fn organize(cfg: &crate::Config, api: &crate::api::Slskd) -> Result<Vec<String>, String> {
+    if !cfg.library.is_dir() || !cfg.downloads.is_dir() {
+        return Err(format!("{} or {} isn't here", cfg.downloads.display(), cfg.library.display()));
+    }
+    let transfers = api.downloads()?; // without knowing what's still downloading, nothing moves
+    let mut done = vec![];
+    for src in finished(&cfg.downloads, &transfers) {
+        let t = guess(&cfg.library, &src);
+        if !t.sure {
+            continue;
+        }
+        match move_to(&t.src, &t.dest, false) {
+            Ok(()) => done.push(format!("{} → {}", src.display(), t.dest.display())),
+            Err(e) => done.push(format!("{} not moved: {e}", src.display())),
+        }
+    }
+    Ok(done)
 }
 
 /// the last move, back where it came from (and what it replaced, back in its place)
