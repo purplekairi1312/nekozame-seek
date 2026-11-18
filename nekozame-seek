@@ -15,7 +15,9 @@ The best one is picked: Enter downloads the whole album.
   nekozame-seek "search words"  the TUI, searching straight away
 
 Settings: ~/.config/nekozame-seek/config.toml
-  url = "http://localhost:5030"   slskd's address (on another machine: its Tailscale name)
+  url = "http://localhost:5030"   slskd's address
+  downloads = "/mnt/Megalodon/Downloads/Soulseek"   where slskd puts them (the library tab)
+  library = "/mnt/Megalodon/Music"                  where they go
   api_key = "..."                 slskd's API key (on the machine slskd runs on, it's read
                                   from ~/slskd/app/slskd.yml when this isn't set)
 """
@@ -44,6 +46,8 @@ def settings():
     except (OSError, tomllib.TOMLDecodeError):
         pass
     conf.setdefault("url", "http://localhost:5030")
+    conf.setdefault("downloads", "/mnt/Megalodon/Downloads/Soulseek")
+    conf.setdefault("library", "/mnt/Megalodon/Music")
     if not conf.get("api_key"):  # on slskd's own machine: its key, read where it's kept
         try:
             text = open(os.path.expanduser("~/slskd/app/slskd.yml")).read()
@@ -192,6 +196,205 @@ def title(a):
     return " / ".join(parts[-2:]) if parts else "(top folder)"
 
 
+# --- the library: finished downloads put where they belong ------------------------------
+#
+# the library's own way: a folder per artist in "Artist Albums", each album in it under the
+# name it came with (tracks keep theirs too); soundtracks in "Soundtracks/Interactive Media"
+# (games) or "Linear Media" (films, series, anime); single songs loose in the artist's folder.
+# nothing moves without being shown first, nothing is ever overwritten, and every move is
+# written down so it can be undone.
+
+KINDS = {"artist": "Artist Albums", "game": "Soundtracks/Interactive Media",
+         "film": "Soundtracks/Linear Media", "unsorted": "Unsorted Archives"}
+KIND_NAMES = {"artist": "artist album", "game": "game soundtrack", "film": "film/series soundtrack",
+              "unsorted": "unsorted"}
+MOVES = os.path.expanduser("~/.local/state/nekozame-seek/moves.jsonl")
+GAME = re.compile(r"(?i)\b(game|video ?game|vgm|ost.*(sega|nintendo|playstation|xbox|snes|nes|gba|psx|ps[1-5])|"
+                  r"nintendo|sega|playstation|soundtrack for the game|chiptune)\b")
+SOUNDTRACK = re.compile(r"(?i)\b(ost|o\.s\.t\.?|original (motion picture |video game |game )?soundtrack|soundtrack|score)\b")
+
+
+def tags(path):
+    """the first music file's tags: albumartist, artist, album, date, genre (what's there)"""
+    try:
+        import mutagen
+    except ImportError:
+        return {}
+    for f in sorted(os.listdir(path)):
+        if ext({"filename": f}) in AUDIO:
+            try:
+                m = mutagen.File(os.path.join(path, f), easy=True)
+            except Exception:  # a broken file: the folder name has to do
+                continue
+            if m and m.tags:
+                return {k: (m.tags.get(k) or [""])[0] for k in ("albumartist", "artist", "album", "date", "genre")}
+    return {}
+
+
+def plain(name):
+    """an artist's name to compare: no case, accents, "the" or punctuation"""
+    import unicodedata
+    n = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    n = re.sub(r"^the\s+", "", n)
+    return re.sub(r"[^a-z0-9]", "", n)
+
+
+def artist_folder(library, artist):
+    """the artist's folder as it already is in the library (its spelling), or the name as it is"""
+    import difflib
+    root = os.path.join(library, KINDS["artist"])
+    want = plain(artist)
+    try:
+        folders = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    except OSError:
+        folders = []
+    for d in folders:
+        if plain(d) == want:
+            return d
+    # a near spelling (Gorillaz / Gorrilaz): the library's, when it's the only one that close
+    close = [d for d in folders if want and difflib.SequenceMatcher(None, plain(d), want).ratio() >= 0.85]
+    if len(close) == 1:
+        return close[0]
+    return artist.replace("/", "-").strip() or "Unknown Artist"
+
+
+def music_files(path):
+    return [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs if ext({"filename": f}) in AUDIO]
+
+
+def guess(library, path):
+    """where a finished download goes: (kind, artist, destination), from its tags and name"""
+    t = tags(path)
+    name = os.path.basename(path)
+    text = f"{name} {t.get('album', '')} {t.get('genre', '')}"
+    artist = t.get("albumartist") or t.get("artist") or ""
+    if not artist:  # "Artist - Album" folders
+        m = re.match(r"^(?:\[[^\]]*\]\s*|\(\d{4}\)\s*|\d{4}\s*[-.]\s*)?(.+?)\s+-\s+.+", name)
+        artist = m.group(1) if m else ""
+    if SOUNDTRACK.search(text) or "soundtrack" in t.get("genre", "").lower():
+        kind = "game" if GAME.search(text) else "film"
+    elif not artist:
+        kind = "unsorted"
+    else:
+        kind = "artist"
+    return kind, artist, destination(library, kind, artist, path)
+
+
+def destination(library, kind, artist, path):
+    name = os.path.basename(path)
+    single = len(music_files(path)) == 1 and not any(os.path.isdir(os.path.join(path, x)) for x in os.listdir(path))
+    if kind == "artist":
+        base = os.path.join(library, KINDS["artist"], artist_folder(library, artist))
+        # one song on its own: loose in the artist's folder, like the library's other singles
+        return os.path.join(base, os.path.basename(music_files(path)[0])) if single else os.path.join(base, name)
+    return os.path.join(library, KINDS[kind], name)
+
+
+def quality_of(path):
+    """a folder's music: the best bit depth/sample rate and its MB, from the files' headers"""
+    try:
+        import mutagen
+    except ImportError:
+        return ""
+    depth = rate = size = 0
+    for f in music_files(path):
+        size += os.path.getsize(f)
+        try:
+            info = mutagen.File(f).info
+            depth = max(depth, getattr(info, "bits_per_sample", 0) or 0)
+            rate = max(rate, getattr(info, "sample_rate", 0) or 0)
+        except Exception:
+            pass
+    q = f"{depth}/{rate / 1000:g} " if depth else ""
+    return f"{q}{size / 1e6:,.0f} MB"
+
+
+def finished(downloads, api):
+    """the download folders that are complete: every file of theirs that slskd fetched has
+    finished, and none has changed in the last minute"""
+    busy = set()
+    try:
+        for u in api.downloads():
+            for d in u.get("directories") or []:
+                if not all("Succeeded" in (f.get("state") or "") for f in d.get("files") or []):
+                    busy.add(re.split(r"[\\/]", d["directory"])[-1])  # downloading, waiting, or failed
+    except (OSError, ValueError):
+        return []
+    out = []
+    for name in sorted(os.listdir(downloads)):
+        path = os.path.join(downloads, name)
+        if name.startswith(".") or not os.path.isdir(path) or name in busy or not music_files(path):
+            continue
+        if time.time() - max(os.path.getmtime(f) for f in music_files(path)) < 60:
+            continue
+        out.append(path)
+    return out
+
+
+def move(src, dest, replace=False):
+    """src to dest, safely. the same disk: a rename (instant, can't half-happen). another disk:
+    every file copied and checked byte for byte first. never over anything: an album that's
+    there already is only replaced when asked, and then kept aside, not deleted.
+    written down in MOVES, so it can be undone"""
+    import hashlib
+    import shutil
+    single = os.path.splitext(dest)[1].lower().lstrip(".") in AUDIO
+    real_src = music_files(src)[0] if single else src
+    aside = None
+    if os.path.lexists(dest):
+        if not replace:
+            raise FileExistsError(f"{dest} is there already")
+        aside = os.path.join(os.path.dirname(dest), f".replaced-{time.strftime('%Y%m%d-%H%M%S')}-{os.path.basename(dest)}")
+        os.rename(dest, aside)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.stat(real_src).st_dev == os.stat(os.path.dirname(dest)).st_dev:
+        os.rename(real_src, dest)
+    else:
+        def digest(p):
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            return h.hexdigest()
+        part = dest + ".part"
+        (shutil.copy2 if single else shutil.copytree)(real_src, part)
+        pairs = [(real_src, part)] if single else [
+            (os.path.join(d, f), os.path.join(part, os.path.relpath(os.path.join(d, f), real_src)))
+            for d, _, fs in os.walk(real_src) for f in fs]
+        for a, b in pairs:
+            if digest(a) != digest(b):
+                shutil.rmtree(part, ignore_errors=True) if not single else os.remove(part)
+                raise OSError(f"the copy of {a} doesn't match: nothing moved")
+        os.rename(part, dest)
+        (os.remove if single else shutil.rmtree)(real_src)
+    if single and os.path.isdir(src) and not music_files(src):
+        shutil.rmtree(src)  # what came with the song (a cover, a log) goes with the download folder
+    os.makedirs(os.path.dirname(MOVES), exist_ok=True)
+    with open(MOVES, "a") as f:
+        f.write(json.dumps({"when": time.strftime("%Y-%m-%d %H:%M:%S"), "from": real_src, "to": dest,
+                            "aside": aside}) + "\n")
+
+
+def undo_last():
+    """the last move, back where it came from (and what it replaced, back in its place)"""
+    try:
+        lines = open(MOVES).read().splitlines()
+    except OSError:
+        return "nothing to undo"
+    if not lines:
+        return "nothing to undo"
+    last = json.loads(lines[-1])
+    if os.path.lexists(last["from"]):
+        return f"can't undo: {last['from']} is there again"
+    os.makedirs(os.path.dirname(last["from"]), exist_ok=True)
+    os.rename(last["to"], last["from"])
+    if last.get("aside") and os.path.lexists(last["aside"]):
+        os.rename(last["aside"], last["to"])
+    with open(MOVES, "w") as f:
+        f.write("".join(l + "\n" for l in lines[:-1]))
+    return f"back in downloads: {os.path.basename(last['from'])}"
+
+
 # --- the TUI -----------------------------------------------------------------------------
 
 HELP = """[b #ffc0e5]How it works[/]
@@ -208,7 +411,7 @@ HELP = """[b #ffc0e5]How it works[/]
   [b]↑ ↓[/] to pick another.
 
   [#b3a7cb]space  what's inside the album        b / s / f  best first / biggest / fastest
-  a / t / r / d  albums / tracks / recent searches / downloads
+  a / t / r / d / l  albums / tracks / recent searches / downloads / library (sort what's done)
   /  search again (↑ ↓ in the box: your recent ones)      q  quit[/]
 """
 
@@ -245,6 +448,8 @@ def tui(first_search=None):
         DataTable > .datatable--header { background: #433a55; color: #ffc0e5; text-style: bold; }
         DataTable > .datatable--cursor { background: #ffc0e5; color: #433a55; text-style: bold; }
         DataTable > .datatable--hover { background: #685c7f; }
+        #libhelp { height: auto; padding: 0 2; color: #e8def5; }
+        #edit { display: none; }
         #inside { height: 14; margin: 0 1; background: #433a55; border-top: solid #ffc0e5; }
         #inside > .datatable--header { background: #433a55; color: #ffc0e5; text-style: bold; }
         Footer { background: #433a55; color: #e8def5; }
@@ -262,6 +467,7 @@ def tui(first_search=None):
             Binding("t", "tab('tracks')", "tracks"),
             Binding("r", "tab('recent')", "recent"),
             Binding("d", "tab('downloads')", "downloads"),
+            Binding("l", "tab('library')", "library"),
             Binding("q", "quit", "quit"),
             Binding("ctrl+c", "quit", "quit", show=False),
         ]
@@ -285,6 +491,11 @@ def tui(first_search=None):
                     yield DataTable(id="history", cursor_type="row")
                 with TabPane("downloads", id="downloads"):
                     yield DataTable(id="transfers", cursor_type="row")
+                with TabPane("library", id="library"):
+                    with Vertical():
+                        yield Static("", id="libhelp")
+                        yield DataTable(id="sorting", cursor_type="row")
+                        yield Input(placeholder="where it goes, inside the library; Enter keeps it, Esc doesn't", id="edit")
             yield Footer()
 
         def on_mount(self):
@@ -298,6 +509,8 @@ def tui(first_search=None):
             self.query_one("#songs", DataTable).add_columns("", "bits", "kHz", "format", "size", "length",
                                                              "from", "can start", "track", "in")
             self.query_one("#history", DataTable).add_columns("search", "when", "results from", "files")
+            self.query_one("#sorting", DataTable).add_columns("", "download", "is", "you have", "goes to")
+            self.todo, self.skipped = [], set()
             self.past, self.back = [], -1
             self.load_history()
             self.query_one("#transfers", DataTable).add_columns("album", "from", "tracks", "done", "state")
@@ -350,7 +563,31 @@ def tui(first_search=None):
             self.poll()
 
         def on_key(self, event):
-            """↑ ↓ in the search box: your recent searches"""
+            """↑ ↓ in the search box: your recent searches. the library tab's own keys"""
+            edit = self.query_one("#edit", Input)
+            if edit.has_focus and event.key == "escape":
+                edit.styles.display = "none"
+                self.query_one("#sorting", DataTable).focus()
+                event.stop()
+                return
+            if self.query_one("#sorting", DataTable).has_focus and event.key in ("e", "k", "x", "u", "o", "n"):
+                event.stop()
+                row = self.library_row()
+                if event.key == "e":
+                    self.action_library_edit()
+                elif event.key == "k":
+                    self.action_library_kind()
+                elif event.key == "u":
+                    self.notify(undo_last())
+                    self.load_library()
+                elif row is not None and event.key == "x":
+                    self.skipped.add(self.todo[row]["src"])
+                    self.load_library()
+                elif row is not None and event.key == "o":
+                    self.sort_one(row, replace=True)
+                elif row is not None and event.key == "n":
+                    self.sort_one(row, both=True)
+                return
             box = self.query_one("#query", Input)
             if not box.has_focus or event.key not in ("up", "down") or not self.past:
                 return
@@ -360,7 +597,100 @@ def tui(first_search=None):
             box.cursor_position = len(box.value)
             event.stop()
 
+        # --- the library tab: finished downloads, where each goes, moved one at a time
+
+        def load_library(self):
+            lib, dl = conf["library"], conf["downloads"]
+            help_ = self.query_one("#libhelp", Static)
+            if not os.path.isdir(lib) or not os.path.isdir(dl):
+                help_.update(f"the library tab sorts on the machine with the music: open nekozame-seek there "
+                             f"({dl} → {lib} aren't here)")
+                return
+            known = {t["src"]: t for t in self.todo}
+            self.todo = []
+            for path in finished(dl, api):
+                if path in self.skipped:
+                    continue
+                if path in known:  # what you changed stays
+                    self.todo.append(known[path])
+                    continue
+                kind, artist, dest = guess(lib, path)
+                self.todo.append({"src": path, "kind": kind, "artist": artist, "dest": dest})
+            t = self.query_one("#sorting", DataTable)
+            at = t.cursor_row
+            t.clear()
+            for x in self.todo:
+                there = os.path.lexists(x["dest"])
+                note = f"{quality_of(x['dest'])} (new: {quality_of(x['src'])})" if there else ""
+                t.add_row("!" if there else "→", os.path.basename(x["src"]), KIND_NAMES[x["kind"]], note,
+                          os.path.relpath(x["dest"], lib))
+            if self.todo:
+                t.move_cursor(row=min(at, len(self.todo) - 1))
+            help_.update(
+                f"[b]{len(self.todo)} finished downloads[/] to put in your library. Nothing moves until you say so; "
+                "nothing is ever overwritten.\n"
+                "[b #ffc0e5]Enter[/]: move it · [b #ffc0e5]e[/]: change where · "
+                "[b #ffc0e5]k[/]: artist album / game / film / unsorted · [b #ffc0e5]x[/]: leave it · "
+                "[b #ffc0e5]u[/]: undo the last move\n"
+                "[b #ffc0e5]![/] you have it already · [b #ffc0e5]o[/]: replace it (the old one is kept aside) · "
+                "[b #ffc0e5]n[/]: keep both")
+
+        def library_row(self):
+            t = self.query_one("#sorting", DataTable)
+            if self.query_one(TabbedContent).active != "library" or not self.todo:
+                return None
+            return min(t.cursor_row, len(self.todo) - 1)
+
+        def sort_one(self, row, replace=False, both=False):
+            x = self.todo[row]
+            dest = x["dest"]
+            if both and os.path.lexists(dest):
+                base, e = os.path.splitext(dest) if os.path.isfile(dest) else (dest, "")
+                n = 2
+                while os.path.lexists(f"{base} ({n}){e}"):
+                    n += 1
+                dest = f"{base} ({n}){e}"
+            if os.path.lexists(dest) and not replace:
+                self.notify("you have it already: o replaces it (the old one is kept aside), n keeps both",
+                            severity="warning")
+                return
+            try:
+                move(x["src"], dest, replace=replace)
+            except (OSError, ValueError) as e:
+                self.notify(f"not moved: {e}", severity="error")
+                return
+            self.notify(f"in your library: {os.path.relpath(dest, conf['library'])}")
+            self.load_library()
+
+        def action_library_kind(self):
+            row = self.library_row()
+            if row is None:
+                return
+            x = self.todo[row]
+            order = list(KINDS)
+            x["kind"] = order[(order.index(x["kind"]) + 1) % len(order)]
+            x["dest"] = destination(conf["library"], x["kind"], x["artist"] or "Unknown Artist", x["src"])
+            self.load_library()
+
+        def action_library_edit(self):
+            row = self.library_row()
+            if row is None:
+                return
+            box = self.query_one("#edit", Input)
+            box.value = os.path.relpath(self.todo[row]["dest"], conf["library"])
+            box.styles.display = "block"
+            box.focus()
+
         def on_input_submitted(self, event):
+            if event.input.id == "edit":
+                row = self.library_row()
+                new = event.value.strip().strip("/")
+                if row is not None and new and ".." not in new.split("/"):
+                    self.todo[row]["dest"] = os.path.join(conf["library"], new)
+                event.input.styles.display = "none"
+                self.query_one("#sorting", DataTable).focus()
+                self.load_library()
+                return
             if event.value.strip():
                 self.back = -1
                 self.start(event.value.strip())
@@ -373,6 +703,8 @@ def tui(first_search=None):
                 self.download(self.singles[event.cursor_row])
             elif event.data_table.id == "history" and self.past:
                 self.open_past(self.past[event.cursor_row])
+            elif event.data_table.id == "sorting" and self.todo:
+                self.sort_one(event.cursor_row)
 
         def poll(self):
             if not self.sid or not self.searching:
@@ -462,7 +794,10 @@ def tui(first_search=None):
 
         def action_tab(self, tab):
             self.query_one(TabbedContent).active = tab
-            table = {"albums": "#results", "tracks": "#songs", "recent": "#history", "downloads": "#transfers"}[tab]
+            table = {"albums": "#results", "tracks": "#songs", "recent": "#history", "downloads": "#transfers",
+                     "library": "#sorting"}[tab]
+            if tab == "library":
+                self.load_library()
             if tab == "recent":
                 self.load_history()
             self.query_one(table, DataTable).focus()

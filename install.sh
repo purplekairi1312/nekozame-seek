@@ -2,7 +2,7 @@
 # nekozame-seek in ~/.local, with Textual (the TUI) next to it, and the command in ~/.local/bin.
 # Run it again to update.
 #   ./install.sh               Textual from PyPI, in its own Python environment
-#   ./install.sh WHEELS_DIR    Textual from wheels you brought (pip download textual -d DIR):
+#   ./install.sh WHEELS_DIR    Textual from wheels you brought (pip download textual mutagen -d DIR):
 #                              for a machine without Python's venv (Debian: python3-venv)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -16,7 +16,7 @@ if [ -n "${1:-}" ]; then
     run="PYTHONPATH=\"$DEST/lib\" exec python3"
 elif python3 -c 'import ensurepip' 2>/dev/null; then
     python3 -m venv "$DEST/venv"
-    "$DEST/venv/bin/pip" install -q --upgrade textual
+    "$DEST/venv/bin/pip" install -q --upgrade textual mutagen
     run="exec \"$DEST/venv/bin/python\""
 else
     echo "no Python venv here: install python3-venv, or give this the wheels (see the top of this file)" >&2
