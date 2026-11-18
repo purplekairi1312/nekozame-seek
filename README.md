@@ -2,8 +2,8 @@
 
 A TUI for Soulseek, meant for servers and high-quality collections. [slskd](https://github.com/slskd/slskd) stays logged in on the server; nekozame-seek is where you search, pick and download, over ssh or anywhere.
 
-- Albums best first: lossless, then the highest bit depth, sample rate and size (only the music counts). Enter downloads the one picked
-- Tracks on their own tab, `space` shows what's inside an album, and your recent searches are kept
+- Albums best pick first: lossless, then the highest bit depth, sample rate and size (only the music files counts). Enter downloads the one picked
+- Individual tracks on their own tab, `space` shows what's inside an album, and your recent searches are kept
 - The library tab moves finished downloads into your library, one at a time after you've seen where to: never over anything, and every move can be undone
 - In [nekozame colours](https://git.sr.ht/~purplekairi1312/nekozame-theme)
 
