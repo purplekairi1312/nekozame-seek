@@ -2,6 +2,8 @@
 
 A TUI for Soulseek, meant for servers and high-quality collections. [slskd](https://github.com/slskd/slskd) stays logged in on the server; nekozame-seek is where you search, pick and download, over ssh or anywhere.
 
+![nekozame-seek: a search for Aphex Twin's Selected Ambient Works 85-92, the 24-bit/96 kHz FLAC vinyl rips first](assets/preview.png)
+
 - Albums best pick first: lossless, then the highest bit depth, sample rate and size (only the music files counts). Enter downloads the one picked
 - Finds what Soulseek blocks searches for (The Beatles, some album titles): it asks again another way (`*eatles`) and keeps what matches what you typed
 - Individual tracks on their own tab, `space` shows what's inside an album, and your recent searches are kept
